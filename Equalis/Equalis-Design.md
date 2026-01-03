@@ -23,7 +23,7 @@
 
 ### 1.1 Protocol Overview
 
-Equalis is a deterministic, lossless credit primitive that replaces price-based liquidations and utilization curves with time-based credit and account-level accounting. The protocol implements a lending system where:
+Equalis is a deterministic, lossless credit primitive that replaces price-based liquidations and utilization curves with time-based credit and account-level accounting. The protocol implements a credit and exchange system where:
 
 - **No liquidations via oracles**: Credit risk is bounded by deterministic rates, terms, and loan-to-value parameters
 - **Account-level solvency**: Each account's obligations are always covered by their own locked principal
@@ -38,12 +38,16 @@ Equalis is a deterministic, lossless credit primitive that replaces price-based 
 4. **Equalis Direct Term Loans**: Peer-to-peer term lending with optional early exercise (American-style settlement), configurable prepayment policies, and borrower-initiated offers
 5. **Equalis Direct Rolling Loans**: Peer-to-peer rolling credit with periodic payments, arrears tracking, amortization support, and configurable grace periods
 6. **Ratio Tranche Offers**: CLOB-style offers with price ratios for variable-size fills, enabling order book-like trading dynamics for both lenders and borrowers
-7. **Auto-Exercise on Fill**: Offers can be configured to immediately exercise upon acceptance, enabling synthetic options use cases
+7. **Yield-Bearing Limit Orders (YBLOs)**: Trading orders that encumber capital at a specified price ratio without creating agreements, supporting partial fills with direct asset transfers while allowing capital to remain productive and enabling spot trading funded by in-pool encumbrances.
 8. **Active Credit Index**: Time-gated fee subsidies for active credit participants (P2P lenders and same-asset borrowers) with weighted dilution anti-gaming protection
 9. **Penalty-Based Default Settlement**: Fixed 5% penalty system for loan defaults instead of full liquidation, ensuring proportional and predictable outcomes
 10. **Normalized Principal Accounting**: Fee base calculations prevent recursive fee inflation while maintaining lending expressiveness across same-asset and cross-asset domains
 11. **EqualIndex Integration**: Multi-asset index token system with deterministic fee structures
 12. **Diamond Architecture**: Modular facet-based design enabling upgradability while maintaining storage isolation
+
+## Gas reality
+
+Yield-Bearing Limit Orders (YBLOs) are measured in Foundry tests with the following gas costs: Post ~550k, Accept ~347k no-fees/~419k fees, Cancel ~58k. These are current measured values, not estimates. The design prioritizes correctness and explicit commitments over raw gas efficiency. See [/Equalis/GAS-ESTIMATES-EL.md](./GAS-ESTIMATES-EL.md) for complete analysis.
 
 ---
 
@@ -125,6 +129,7 @@ Equalis uses the EIP-2535 Diamond standard for modular contract architecture:
 | **EqualisDirectRollingAgreementFacet** | P2P rolling acceptance | `acceptRollingOffer` |
 | **EqualisDirectRollingPaymentFacet** | P2P rolling payments | `makeRollingPayment` |
 | **EqualisDirectRollingLifecycleFacet** | P2P rolling lifecycle | `recoverRolling`, `exerciseRolling`, `repayRollingInFull` |
+| **EqualisDirectLimitOrderFacet** | P2P YBLO trading | `postLimitOrder`, `acceptLimitOrder`, `cancelLimitOrder` |
 | **EqualIndex Facets (V3)** | Multi-asset index tokens | Admin (`setIndexFees`, `setPaused`), Actions (`mint`, `burn`, `flashLoan`), View (`getIndex`, `getIndexAssets`, etc.) |
 | **MaintenanceFacet** | AUM fee management | `pokeMaintenance`, `settleMaintenance` |
 | **Admin / Governance** | Protocol governance | `setTimelock`, `setTreasury`, protocol splits |
@@ -249,7 +254,7 @@ paid = min(outstanding, poolAvailable, contractBalance);
 // Single NFT can have state across multiple pools
 struct MultiPoolPositionState {
     uint256 tokenId;
-    address positionKey;            // Same key across all pools
+    bytes32 positionKey;            // Same key across all pools
     mapping(uint256 => PoolPositionState) poolStates;
 }
 
@@ -310,14 +315,14 @@ A second tranche type lets lenders quote a price ratio instead of fixed-size fil
 
 **Storage**:
 ```solidity
-mapping(address => mapping(uint256 => bool)) joined; // positionKey => poolId => joined
+mapping(bytes32 => mapping(uint256 => bool)) joined; // positionKey => poolId => joined
 ```
 
 **Membership Operations**:
 
 1. **Auto-Join** (`_ensurePoolMembership`):
    ```solidity
-   function _ensurePoolMembership(address positionKey, uint256 pid, bool allowAutoJoin) 
+   function _ensurePoolMembership(bytes32 positionKey, uint256 pid, bool allowAutoJoin) 
        returns (bool alreadyMember) 
    {
        if (store.joined[positionKey][pid]) return true;
@@ -329,7 +334,7 @@ mapping(address => mapping(uint256 => bool)) joined; // positionKey => poolId =>
 
 2. **Leave Pool** (`_leavePool`):
    ```solidity
-   function _leavePool(address positionKey, uint256 pid, bool canClear, string memory reason) {
+   function _leavePool(bytes32 positionKey, uint256 pid, bool canClear, string memory reason) {
        require(canClear, reason);
        delete store.joined[positionKey][pid];
    }
@@ -366,11 +371,11 @@ Pools may be initialized as **managed**, designating a manager account and stori
 **Whitelist Storage**:
 ```solidity
 // Whitelist keyed by positionKey (not tokenId directly)
-mapping(address => bool) whitelist;  // positionKey => whitelisted
+mapping(bytes32 => bool) whitelist;  // positionKey => whitelisted
 
 // Adding to whitelist derives positionKey from tokenId
 function addToWhitelist(uint256 pid, uint256 tokenId) external {
-    address positionKey = nft.getPositionKey(tokenId);
+    bytes32 positionKey = nft.getPositionKey(tokenId);
     p.whitelist[positionKey] = true;
 }
 ```
@@ -728,7 +733,6 @@ struct DirectOffer {
     uint256 collateralLockAmount;   // Amount of collateralAsset required
     bool allowEarlyRepay;           // Whether borrower can repay before maturity
     bool allowEarlyExercise;        // Whether borrower can exercise early (forfeit collateral)
-    bool autoExerciseOnFill;        // If true, acceptance immediately exercises the agreement
     bool allowLenderCall;           // Whether lender can accelerate due timestamp
     bool cancelled;
     bool filled;
@@ -750,7 +754,6 @@ struct DirectBorrowerOffer {
     uint256 collateralLockAmount;
     bool allowEarlyRepay;
     bool allowEarlyExercise;
-    bool autoExerciseOnFill;
     bool allowLenderCall;
     bool cancelled;
     bool filled;
@@ -774,7 +777,6 @@ struct DirectRatioTrancheOffer {
     bool allowEarlyRepay;
     bool allowEarlyExercise;
     bool allowLenderCall;
-    bool autoExerciseOnFill;
     bool cancelled;
     bool filled;
 }
@@ -797,7 +799,6 @@ struct DirectBorrowerRatioTrancheOffer {
     bool allowEarlyRepay;
     bool allowEarlyExercise;
     bool allowLenderCall;
-    bool autoExerciseOnFill;
     bool cancelled;
     bool filled;
 }
@@ -818,7 +819,6 @@ struct DirectAgreement {
     uint256 collateralLockAmount;
     bool allowEarlyRepay;
     bool allowEarlyExercise;
-    bool autoExerciseOnFill;
     bool allowLenderCall;
     DirectStatus status;            // Active, Repaid, Defaulted, Exercised
     bool interestRealizedUpfront;   // Always true
@@ -845,7 +845,6 @@ enum DirectStatus {
    - Verify borrower owns Position NFT
    - Check borrower has sufficient collateral
    - Lock collateral per pool: `directLockedPrincipal[borrowerKey][collateralPoolId] += collateralLockAmount`
-   - If `autoExerciseOnFill = true`, requires `allowEarlyExercise = true`
    - Store offer with unique ID
    - Emit `BorrowerOfferPosted` event
 
@@ -858,7 +857,6 @@ enum DirectStatus {
    - Transfer escrow to active loan
    - Transfer principal from lender pool to borrower
    - Create agreement with status Active
-   - If `autoExerciseOnFill = true`, immediately execute exercise
 
 4. **Accept Borrower Offer**: `acceptBorrowerOffer(offerId, lenderPositionId)`
    - Verify lender owns Position NFT
@@ -868,7 +866,6 @@ enum DirectStatus {
    - Distribute fees to lender, FeeIndex, protocol, and Active Credit Index
    - Transfer principal from lender pool to borrower (minus fees)
    - Create agreement with status Active
-   - If `autoExerciseOnFill = true`, immediately execute exercise
 
 5. **Repay**: `repay(agreementId)`
    - Verify borrower owns agreement
@@ -919,7 +916,6 @@ function acceptRatioTrancheOffer(uint256 offerId, uint256 borrowerPositionId, ui
 - Lender escrows `principalCap` at post time
 - Borrowers draw any amount between `minPrincipalPerFill` and `principalRemaining`
 - Required collateral computed as: `collateral = principal × priceNumerator / priceDenominator`
-- Supports `autoExerciseOnFill` for synthetic options use cases
 
 **Borrower Ratio Tranche Offers**:
 
@@ -935,14 +931,97 @@ function acceptBorrowerRatioTrancheOffer(uint256 offerId, uint256 lenderPosition
 - Borrower locks `collateralCap` at post time
 - Lenders fill any amount between `minCollateralPerFill` and `collateralRemaining`
 - Principal computed as: `principal = collateral × priceNumerator / priceDenominator`
-- Supports `autoExerciseOnFill` for synthetic options use cases
 
 **Use Cases**:
-- **Synthetic Options**: Borrowers can create put-like positions by posting offers with `autoExerciseOnFill = true`
 - **CLOB-Style Trading**: Variable-size fills enable order book-like trading dynamics
 - **Price Discovery**: Multiple counterparties can fill at the posted ratio
 
-### 4.8 Equalis Direct - Rolling Loans (P2P Rolling Credit)
+### 4.8 Equalis Direct - YBLO (P2P Trading)
+
+**Overview**: Trading orders that encumber capital at a specified price ratio without creating agreements. Fills resolve via direct asset transfers rather than agreement creation, providing a trading path where capital remains on platform earning yield while waiting for fills.
+
+**Key Features**:
+- **No Agreement Creation**: Fills transfer assets directly between maker and taker positions
+- **Partial Fills**: Orders support multiple partial fills down to a configurable minimum
+- **Capital Efficiency**: Encumbered capital continues earning fee index yield while waiting for fills
+- **Lightweight Fees**: Flat basis points fee on filled amount (no APR/duration calculation)
+- **Bilateral Trading**: Both lenders and borrowers can post YBLO's
+- **Solvency Integration**: Encumbered amounts included in LTV calculations for other offer types
+
+**Data Structures**:
+```solidity
+struct LimitOrder {
+    uint256 orderId;
+    address owner;
+    uint256 positionId;
+    uint256 makerPoolId;           // Pool for maker-side asset
+    address borrowAsset;
+    address collateralAsset;
+    uint256 priceNumerator;        // collateral = principal * num / denom
+    uint256 priceDenominator;
+    uint256 cap;                   // Total amount available for fills
+    uint256 remaining;             // Unfilled amount
+    uint256 minFill;               // Minimum fill amount
+    bool isBorrowerSide;           // true = borrower posting collateral
+    bool active;                   // Order can be filled
+    bool cancelled;                // Order was cancelled
+}
+
+struct LimitOrderConfig {
+    uint16 feeBps;                 // Flat fee in basis points
+    uint16 treasuryFeeBps;         // Portion of fee sent to treasury
+    address treasury;              // Treasury recipient
+}
+```
+
+**Lifecycle**:
+
+1. **Post YBLO*: `postLimitOrder(LimitOrderParams)`
+   - Verify maker owns Position NFT
+   - Validate maker pool and assets exist and match
+   - Check available principal vs existing encumbrance
+   - Increase encumbrance by cap amount (reuses existing directOfferEscrow/directLockedPrincipal mappings)
+   - Store order with remaining = cap, active = true
+   - Emit `LimitOrderPosted` event
+
+2. **Accept YBLO**: `acceptLimitOrder(orderId, takerPositionId, takerPoolId, fillAmount)`
+   - Validate order is active and not cancelled
+   - Validate fillAmount within [minFill, remaining]
+   - Validate taker pool asset matches counterparty asset
+   - Compute counterparty amount using price ratio
+   - Reduce encumbrance by fill amount
+   - Apply lightweight fee (deducted from taker's received amount)
+   - Transfer assets between maker and taker positions
+   - Mark order filled if remaining == 0
+   - Emit `LimitOrderFilled` event
+
+3. **Cancel YBLO**: `cancelLimitOrder(orderId)`
+   - Verify caller is order owner
+   - Release remaining encumbrance
+   - Mark order cancelled and inactive
+   - Emit `LimitOrderCancelled` event
+
+**Price Ratio Mechanics**:
+- Lender-side orders (`isBorrowerSide = false`): `collateral = fillAmount * priceNumerator / priceDenominator`
+- Borrower-side orders (`isBorrowerSide = true`): `principal = fillAmount * priceDenominator / priceNumerator`
+
+**Fee Distribution**:
+- Fee calculated as: `fillAmount * feeBps / 10000`
+- Fee deducted from taker's received amount
+- Fee split between treasury and fee index according to configured ratios
+
+**Position Transfer Handling**:
+- When a position NFT is transferred, all outstanding YBLO's for that position are automatically cancelled
+- All encumbered amounts are released
+- `LimitOrderCancelled` events emitted with Transfer reason
+
+**Use Cases**:
+- **Spot Trading**: Direct asset exchange at specified ratios without loan agreements
+- **Capital Parking**: Earn yield while waiting for favorable fill prices
+- **Order Book Trading**: CLOB-style trading dynamics with partial fills
+- **Gas Efficiency**: Lower gas costs compared to agreement-based flows
+
+### 4.9 Equalis Direct - Rolling Loans (P2P Rolling Credit)
 
 **Overview**: Bilateral rolling credit between Position NFT holders with periodic payments, arrears tracking, and configurable amortization.
 
@@ -1106,7 +1185,7 @@ borrowerRefund = remainingAfterPenalty - amountForDebt
 lenderShare = amountForDebt - protocolShare - feeIndexShare - activeCreditShare
 ```
 
-### 4.9 Direct Lending Configuration
+### 4.10 Direct Lending Configuration
 
 **Term Loan Configuration**:
 ```solidity
@@ -1160,7 +1239,7 @@ directSameAssetDebt[positionKey][asset]      // Same-asset debt tracking
 - `directLockedPrincipal + directOfferEscrow <= userPrincipal` (per position, per pool)
 - `defaultFeeIndexBps + defaultProtocolBps + defaultActiveCreditIndexBps <= 10000`
 
-### 4.10 Flash Loan System
+### 4.11 Flash Loan System
 
 **Pool-Local Flash Loans**:
 - Borrow from single pool's `trackedBalance`
@@ -1183,7 +1262,7 @@ function flashLoan(uint256 pid, address receiver, uint256 amount, bytes calldata
 }
 ```
 
-### 4.11 EqualIndex (Multi-Asset Index Tokens)
+### 4.12 EqualIndex (Multi-Asset Index Tokens)
 
 **Overview**: Basket tokens holding fixed-weight portfolios of ERC20 assets.
 
@@ -1330,7 +1409,7 @@ struct PoolData {
     address manager;
     ManagedPoolConfig managedConfig;
     bool whitelistEnabled;
-    mapping(address => bool) whitelist;  // Keyed by positionKey
+    mapping(bytes32 => bool) whitelist;  // Keyed by positionKey
     
     // Operational state
     uint256 totalDeposits;          // Sum of all user principals
@@ -1436,7 +1515,7 @@ function getPositionKey(uint256 tokenId) public view returns (address) {
 
 **Total Debt Calculation**:
 ```solidity
-function calculateTotalDebt(PoolData storage p, address positionKey, uint256 poolId) 
+function calculateTotalDebt(PoolData storage p, bytes32 positionKey, uint256 poolId) 
     internal view returns (uint256) 
 {
     uint256 debt = 0;
@@ -1461,7 +1540,7 @@ function calculateTotalDebt(PoolData storage p, address positionKey, uint256 poo
 ```solidity
 function checkSolvency(
     PoolData storage p,
-    address positionKey,
+    bytes32 positionKey,
     uint256 newPrincipal,
     uint256 newDebt
 ) internal view returns (bool) {
@@ -1697,6 +1776,13 @@ event RollingPaymentMade(uint256 indexed agreementId, address indexed payer, uin
 event RollingAgreementRecovered(uint256 indexed agreementId, address indexed executor, uint256 penaltyPaid, uint256 arrearsPaid, uint256 principalRecovered, uint256 borrowerRefund, uint256 protocolShare, uint256 feeIndexShare, uint256 activeCreditShare);
 event RollingAgreementExercised(uint256 indexed agreementId, address indexed borrower, uint256 arrearsPaid, uint256 principalRecovered, uint256 borrowerRefund);
 event RollingAgreementRepaid(uint256 indexed agreementId, address indexed borrower, uint256 repaymentAmount, uint256 arrearsCleared, uint256 principalCleared);
+```
+
+**YBLO Events**:
+```solidity
+event LimitOrderPosted(uint256 indexed orderId, address indexed owner, uint256 indexed positionId, uint256 makerPoolId, address borrowAsset, address collateralAsset, uint256 priceNumerator, uint256 priceDenominator, uint256 cap, uint256 minFill, bool isBorrowerSide);
+event LimitOrderFilled(uint256 indexed orderId, address indexed taker, uint256 indexed takerPositionId, uint256 takerPoolId, uint256 fillAmount, uint256 counterpartyAmount, uint256 remaining, uint256 feeAmount);
+event LimitOrderCancelled(uint256 indexed orderId, uint256 releasedAmount, LimitOrderCancelReason reason);
 ```
 
 **Active Credit Index Events**:
@@ -1973,6 +2059,10 @@ DirectRollingConfig memory rollingConfig = DirectRollingConfig({
 - **Borrower Offer**: Direct lending offer posted by borrower specifying desired terms
 - **Ratio Tranche Offer**: CLOB-style offer with price ratio for variable-size fills
 - **Borrower Ratio Tranche Offer**: Borrower-posted ratio tranche offer with collateral cap
+- **Yield Bearing Limit Order (YBLO)**: Trading order that encumbers capital at a specified price ratio without creating agreements
+- **Maker**: Party posting a YBLO (either lender or borrower side)
+- **Taker**: Party accepting/filling a YBLO (pays the fee)
+- **Fill Amount**: Maker-side amount in a YBLO fill (principal for lender-side, collateral for borrower-side)
 
 ### A.2 Formula Reference
 
@@ -2044,4 +2134,4 @@ collateralRequired = (principalAmount * priceNumerator) / priceDenominator
 
 ---
 
-**Document Version:** 6.0
+**Document Version:** 7.0

@@ -1,6 +1,6 @@
 # EqualX Gas Efficiency Report
 
-_Generated via Foundry gas reports on 2025‑12‑29 (UTC) after the swap-path simplification (direct-only, token-in fees, no tips/slippage/deskScope, dedicated ETH entrypoint)._
+_Generated via Foundry gas reports on 2025‑12‑29 (UTC)_
 
 ## Methodology
 - Commands:
@@ -83,6 +83,6 @@ _Notes_:
 | Committee refund path (no presig) (`testCommitteeRefundWhenMakerNeverPublishesPresig`) | AtomicDesk + `SettlementEscrow.refund` | 658,427 |
 
 _Notes_:
-- Atomic flows remain isolated from the router; costs unchanged by the router simplification.
+- ETH <> XMR Atomic flows remain isolated from the router; costs unchanged by the router simplification.
 - Native ETH collateral adds ~350k gas over ERC20 collateral due to value handling.
 

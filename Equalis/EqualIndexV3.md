@@ -37,7 +37,7 @@ EqualIndex V3 is a tokenized asset basket system that enables users to create, m
 - **Dual-balance architecture**: Vault balances (NAV) and fee pots (accumulated fees)
 - **Proportional ownership**: Minting preserves proportional share across all assets
 - **Immediate protocol revenue**: Protocol fees transferred directly to treasury when configured
-- **Diamond proxy pattern**: Modular facets for upgradeable functionality
+- **Diamond proxy pattern**: Modular facets. Diamond pattern used to avoid code size limits.
 - **No external oracles**: Deterministic pricing based on bundle composition
 
 ---
