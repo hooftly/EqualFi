@@ -1,6 +1,6 @@
 # Equalis Protocol - Design Document
 
-**Version:** 8.0  
+**Version:** 9.0  
 
 ---
 
@@ -85,7 +85,7 @@ Equalis is a deterministic, lossless credit primitive that replaces price-based 
 │                                                                 │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Shared Libraries                           │
-│  LibFeeIndex │ LibMaintenance │ LibLoan │ LibSolvency │ ...     │
+│  LibFeeIndex │ LibNetEquity │ LibEncumbrance │ LibSolvency │... │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Diamond Storage                            │
 │  AppStorage │ DirectStorage │ IndexStorage │ NFTStorage         │
@@ -416,6 +416,11 @@ Unmanaged pools remain permissionless and immutable after creation.
 - Action fees (configurable)
 - **Note**: Interest is not charged on self-secured same-asset borrowing; protocol revenue derives from usage-based fees
 
+**Core Libraries**:
+- `LibFeeIndex`: Fee index accounting and settlement (1e18 scale)
+- `LibNetEquity`: Pure helpers for fee base calculations
+- `LibActiveCreditIndex`: Time-gated subsidy distribution for active credit participants
+
 **Mechanism**:
 ```solidity
 // Global pool index (1e18 scale)
@@ -424,8 +429,9 @@ feeIndex = feeIndex + (feeAmount * 1e18) / totalDeposits
 // Active Credit Index (parallel system)
 activeCreditIndex = activeCreditIndex + (activeCreditAmount * 1e18) / totalActiveWeight
 
-// Per-user settlement with normalized fee base
-feeBase = calculateNormalizedFeeBase(user, poolAsset)
+// Per-user settlement with normalized fee base (LibFeeIndex.settle)
+sameAssetDebt = LibSolvencyChecks.calculateSameAssetDebt(p, user, poolAsset)
+feeBase = LibNetEquity.calculateFeeBaseSameAsset(principal, sameAssetDebt)
 delta = feeIndex - userFeeIndex[user]
 yield = (feeBase * delta) / 1e18
 userAccruedYield[user] += yield
@@ -474,32 +480,45 @@ newStartTime = currentTime - newTimeCredit
 
 **Normalized Fee Base Calculation**:
 
-The fee base calculation depends on the relationship between assets and debt:
+The fee base calculation is centralized in `LibNetEquity` and depends on the relationship between assets and debt:
 
-**1. Pool-Native Borrowing (Same Asset)**:
+**1. Pool-Native Borrowing (Same Asset)** - `LibNetEquity.calculateFeeBaseSameAsset`:
 ```solidity
 function calculateFeeBaseSameAsset(uint256 principal, uint256 sameAssetDebt) 
-    returns (uint256 feeBase) 
+    internal pure returns (uint256) 
 {
     return principal >= sameAssetDebt ? principal - sameAssetDebt : 0;
 }
 ```
 
-**2. P2P Direct Lending**:
-
-**Same-Asset P2P** (`collateralAsset == lentAsset`):
+**2. Cross-Asset Domains** - `LibNetEquity.calculateFeeBaseCrossAsset`:
 ```solidity
-// Borrower fee base netted against P2P debt to prevent recursion
-feeBase = max(0, collateralPrincipal - sameAssetP2PDebt)
+function calculateFeeBaseCrossAsset(uint256 lockedCollateral, uint256 unlockedPrincipal)
+    internal pure returns (uint256)
+{
+    return lockedCollateral + unlockedPrincipal;
+}
 ```
 
-**Cross-Asset P2P** (`collateralAsset != lentAsset`):
+**3. P2P Borrower Fee Base** - `LibNetEquity.calculateP2PBorrowerFeeBase`:
 ```solidity
-// No netting required - different asset domains
-feeBase = lockedCollateral + unlockedPrincipal
+function calculateP2PBorrowerFeeBase(
+    uint256 lockedCollateral,
+    uint256 unlockedPrincipal,
+    uint256 sameAssetDebt,
+    bool isSameAsset
+) internal pure returns (uint256 feeBase) {
+    if (isSameAsset) {
+        // Same-asset P2P: net against debt to prevent recursion
+        uint256 principal = calculateFeeBaseCrossAsset(lockedCollateral, unlockedPrincipal);
+        return calculateFeeBaseSameAsset(principal, sameAssetDebt);
+    }
+    // Cross-asset P2P: no netting required
+    return calculateFeeBaseCrossAsset(lockedCollateral, unlockedPrincipal);
+}
 ```
 
-**3. Lender Principal Adjustment**:
+**4. Lender Principal Adjustment**:
 ```solidity
 // On P2P offer acceptance
 lenderPrincipal -= lentAmount  // Immediate reduction
@@ -576,9 +595,84 @@ userPrincipal[user] -= reduction
 - Foundation receiver address for fee collection
 - Paid from pool's `trackedBalance`
 
-### 4.5 Pool Loan Management
+### 4.5 Centralized Encumbrance System (LibEncumbrance)
 
-#### 4.5.1 Rolling Credit Loans
+**Purpose**: Provide unified storage and API for all encumbrance components per position and pool, replacing scattered direct storage mappings.
+
+**Core Library**: `LibEncumbrance` centralizes all encumbrance tracking:
+
+```solidity
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked as borrower (options, futures, MAM, P2P collateral)
+    uint256 directLent;         // Principal exposed as lender (AMM reserves)
+    uint256 directOfferEscrow;  // Escrowed offers awaiting acceptance
+    uint256 indexEncumbered;    // Principal backing index tokens
+}
+
+struct EncumbranceStorage {
+    mapping(bytes32 => mapping(uint256 => Encumbrance)) encumbrance;
+    mapping(bytes32 => mapping(uint256 => mapping(uint256 => uint256))) encumberedByIndex;
+}
+```
+
+**API Functions**:
+```solidity
+// Get encumbrance struct (storage reference for modification)
+LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, poolId);
+
+// Get encumbrance struct (memory copy for reading)
+LibEncumbrance.Encumbrance memory enc = LibEncumbrance.get(positionKey, poolId);
+
+// Get total encumbrance across all components
+uint256 totalEncumbered = LibEncumbrance.total(positionKey, poolId);
+
+// Index-specific encumbrance operations
+LibEncumbrance.encumberIndex(positionKey, poolId, indexId, amount);
+LibEncumbrance.unencumberIndex(positionKey, poolId, indexId, amount);
+uint256 indexTotal = LibEncumbrance.getIndexEncumbered(positionKey, poolId);
+uint256 forIndex = LibEncumbrance.getIndexEncumberedForIndex(positionKey, poolId, indexId);
+```
+
+**Wrapper Libraries**:
+- `LibIndexEncumbrance`: Thin wrapper for index-specific encumbrance operations
+- `LibDerivativeHelpers`: Uses `LibEncumbrance` for derivative collateral locking
+
+**Integration Points**:
+- `LibSolvencyChecks.calculateAvailablePrincipal`: Uses `LibEncumbrance.get()` to compute available principal
+- `PositionViewFacet`: Uses `LibEncumbrance.get()` for position state queries
+- `MultiPoolPositionViewFacet`: Aggregates encumbrance across pools using `LibEncumbrance`
+- Direct lending facets: Use `LibEncumbrance.position()` for offer escrow and collateral locking
+- Derivative facets: Use `LibDerivativeHelpers` which delegates to `LibEncumbrance`
+
+**Events**:
+```solidity
+event EncumbranceIncreased(
+    bytes32 indexed positionKey,
+    uint256 indexed poolId,
+    uint256 indexed indexId,
+    uint256 amount,
+    uint256 totalEncumbered,
+    uint256 indexEncumbered
+);
+event EncumbranceDecreased(
+    bytes32 indexed positionKey,
+    uint256 indexed poolId,
+    uint256 indexed indexId,
+    uint256 amount,
+    uint256 totalEncumbered,
+    uint256 indexEncumbered
+);
+```
+
+**Benefits**:
+- **Single Source of Truth**: All encumbrance data in one storage location
+- **Consistent API**: Uniform access pattern across all facets
+- **Gas Efficiency**: Single storage read for all encumbrance components
+- **Auditability**: Clear separation of encumbrance types with events
+
+### 4.6 Pool Loan Management
+
+#### 4.6.1 Rolling Credit Loans
 
 **Characteristics**:
 - Open-ended credit lines
@@ -631,7 +725,7 @@ struct RollingCreditLoan {
 - `rollingDelinquencyEpochs`: Default 2 missed payments (delinquent status)
 - `rollingPenaltyEpochs`: Default 3 missed payments (penalty eligible)
 
-#### 4.5.2 Fixed-Term Loans
+#### 4.6.2 Fixed-Term Loans
 
 **Characteristics**:
 - Explicit term with fixed expiry
@@ -670,7 +764,7 @@ struct FixedTermLoan {
 }
 ```
 
-### 4.6 Penalty-Based Settlement (No Liquidations)
+### 4.7 Penalty-Based Settlement (No Liquidations)
 
 **Trigger Conditions**:
 - **Rolling**: 3+ missed payments (configurable via `rollingPenaltyEpochs`)
@@ -710,7 +804,7 @@ function calculatePenalty(uint256 principalAtOpen) internal pure returns (uint25
 - **Predictable Loss**: Maximum loss is always 5% of `principalAtOpen`
 - **Fairness**: Same penalty percentage whether at 50% or 95% utilization
 
-### 4.7 Equalis Direct - Term Loans (P2P Lending)
+### 4.8 Equalis Direct - Term Loans (P2P Lending)
 
 **Overview**: Bilateral term lending between Position NFT holders with upfront fee realization, optional early exercise, and configurable prepayment policies. Both lenders and borrowers can post offers.
 
@@ -957,7 +1051,7 @@ function acceptBorrowerRatioTrancheOffer(uint256 offerId, uint256 lenderPosition
 - **CLOB-Style Trading**: Variable-size fills enable order book-like trading dynamics
 - **Price Discovery**: Multiple counterparties can fill at the posted ratio
 
-### 4.8 Equalis Direct - Rolling Loans (P2P Rolling Credit)
+### 4.9 Equalis Direct - Rolling Loans (P2P Rolling Credit)
 
 **Overview**: Bilateral rolling credit between Position NFT holders with periodic payments, arrears tracking, and configurable amortization.
 
@@ -1121,7 +1215,7 @@ borrowerRefund = remainingAfterPenalty - amountForDebt
 lenderShare = amountForDebt - protocolShare - feeIndexShare - activeCreditShare
 ```
 
-### 4.10 Direct Lending Configuration
+### 4.11 Direct Lending Configuration
 
 **Term Loan Configuration**:
 ```solidity
@@ -1162,20 +1256,38 @@ struct DirectRollingConfig {
 ```
 
 **Position State Extensions**:
+
+Encumbrance tracking is centralized in `LibEncumbrance`, providing a unified storage and API for all encumbrance components per position and pool:
+
 ```solidity
-// Per position key and pool ID
-directLockedPrincipal[positionKey][poolId]   // Collateral locked as borrower
-directLentPrincipal[positionKey][poolId]     // Principal exposed as lender
-directBorrowedPrincipal[positionKey][poolId] // Principal borrowed
-directOfferEscrow[positionKey][poolId]       // Escrowed offers
-directSameAssetDebt[positionKey][asset]      // Same-asset debt tracking
+// LibEncumbrance.Encumbrance struct (per position key and pool ID)
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked as borrower
+    uint256 directLent;         // Principal exposed as lender (AMM reserves)
+    uint256 directOfferEscrow;  // Escrowed offers
+    uint256 indexEncumbered;    // Principal backing index tokens
+}
+
+// Access via LibEncumbrance
+LibEncumbrance.Encumbrance memory enc = LibEncumbrance.get(positionKey, poolId);
+uint256 totalEncumbered = LibEncumbrance.total(positionKey, poolId);
+
+// Per-index tracking for index encumbrance
+uint256 indexSpecific = LibEncumbrance.getIndexEncumberedForIndex(positionKey, poolId, indexId);
+```
+
+Additional Direct storage mappings:
+```solidity
+// DirectStorage (LibDirectStorage)
+directBorrowedPrincipal[positionKey][poolId]  // Principal borrowed
+directSameAssetDebt[positionKey][asset]       // Same-asset debt tracking
 ```
 
 **Invariants**:
-- `directLockedPrincipal + directOfferEscrow <= userPrincipal` (per position, per pool)
+- `LibEncumbrance.total(positionKey, poolId) <= userPrincipal[positionKey]` (per position, per pool)
 - `defaultFeeIndexBps + defaultProtocolBps + defaultActiveCreditIndexBps <= 10000`
 
-### 4.11 Flash Loan System
+### 4.12 Flash Loan System
 
 **Pool-Local Flash Loans**:
 - Borrow from single pool's `trackedBalance`
@@ -1198,7 +1310,7 @@ function flashLoan(uint256 pid, address receiver, uint256 amount, bytes calldata
 }
 ```
 
-### 4.12 EqualIndex (Multi-Asset Index Tokens)
+### 4.13 EqualIndex (Multi-Asset Index Tokens)
 
 **Overview**: Basket tokens holding fixed-weight portfolios of ERC20 assets.
 
@@ -1246,16 +1358,14 @@ struct Index {
 
 ### 5.1 Pool Configuration
 
-**Immutable Configuration** (set at pool creation for unmanaged pools):
+**Pool Configuration** (set at pool creation for unmanaged pools):
 ```solidity
-struct ImmutablePoolConfig {
+struct PoolConfig {
     // Interest rates
     uint16 rollingApyBps;           // Deposit-backed rolling APY
-    uint16 rollingApyBpsExternal;   // External collateral rolling APY
     
     // LTV and collateralization
     uint16 depositorLTVBps;         // Max LTV for deposit-backed (e.g., 8000 = 80%)
-    uint16 externalBorrowCRBps;     // External collateral ratio
     
     // Maintenance
     uint16 maintenanceRateBps;      // Annual AUM fee rate
@@ -1295,11 +1405,9 @@ struct ImmutablePoolConfig {
 struct ManagedPoolConfig {
     // Interest rates (mutable)
     uint16 rollingApyBps;
-    uint16 rollingApyBpsExternal;
 
     // LTV and collateralization (mutable)
     uint16 depositorLTVBps;
-    uint16 externalBorrowCRBps;
 
     // Maintenance and flash loan fees (mutable)
     uint16 maintenanceRateBps;
@@ -1336,7 +1444,7 @@ struct ManagedPoolConfig {
 ```solidity
 struct PoolData {
     address underlying;             // ERC20 asset
-    ImmutablePoolConfig immutableConfig;
+    PoolConfig poolConfig;
     uint16 currentAumFeeBps;        // Within bounds
     bool deprecated;                // UI flag
     
@@ -1449,47 +1557,61 @@ function getPositionKey(uint256 tokenId) public view returns (bytes32) {
 
 ### 6.1 Solvency Calculation
 
-**Total Debt Calculation**:
+**Total Debt Calculation** (via `LibSolvencyChecks`):
 ```solidity
-function calculateTotalDebt(PoolData storage p, bytes32 positionKey, uint256 poolId) 
-    internal view returns (uint256) 
-{
-    uint256 debt = 0;
+function calculateTotalDebt(
+    PoolData storage p,
+    bytes32 positionKey,
+    uint256 pid
+) internal view returns (uint256 totalDebt) {
+    // Loan debts (rolling + fixed-term)
+    (,, uint256 loanDebt) = calculateLoanDebts(p, positionKey);
     
-    // Rolling loan debt
-    if (p.rollingLoans[positionKey].active) {
-        debt += p.rollingLoans[positionKey].principalRemaining;
-    }
-    
-    // Fixed-term loan debt (cached)
-    debt += p.fixedTermPrincipalRemaining[positionKey];
-    
-    // Direct lending exposure (treated as debt-like per pool)
+    // Direct borrowed principal
     DirectStorage storage ds = LibDirectStorage.directStorage();
-    debt += ds.directLentPrincipal[positionKey][poolId];
+    uint256 directDebt = ds.directBorrowedPrincipal[positionKey][pid];
     
-    return debt;
+    totalDebt = loanDebt + directDebt;
 }
 ```
 
-**Solvency Check**:
+**Available Principal Calculation** (via `LibSolvencyChecks` using centralized `LibEncumbrance`):
+```solidity
+function calculateAvailablePrincipal(
+    PoolData storage p,
+    bytes32 positionKey,
+    uint256 pid
+) internal view returns (uint256 available) {
+    uint256 principal = p.userPrincipal[positionKey];
+    
+    // Get all encumbrance components from centralized storage
+    LibEncumbrance.Encumbrance memory enc = LibEncumbrance.get(positionKey, pid);
+    uint256 totalEncumbered = 
+        enc.directLocked + enc.directLent + enc.directOfferEscrow + enc.indexEncumbered;
+    
+    if (totalEncumbered >= principal) {
+        return 0;
+    }
+    available = principal - totalEncumbered;
+}
+```
+
+**Solvency Check** (via `LibSolvencyChecks`):
 ```solidity
 function checkSolvency(
     PoolData storage p,
     bytes32 positionKey,
     uint256 newPrincipal,
     uint256 newDebt
-) internal view returns (bool) {
+) internal view returns (bool isSolvent) {
     if (newDebt == 0) return true;
     
-    DirectStorage storage ds = LibDirectStorage.directStorage();
-    uint256 lockedDirect = ds.directLockedPrincipal[positionKey][poolId];
+    // LTV must be set to a non-zero value; zero disables borrowing
+    uint16 ltvBps = p.poolConfig.depositorLTVBps;
+    if (ltvBps == 0) return false;
     
-    if (newPrincipal < lockedDirect) return false;
-    uint256 availableCollateral = newPrincipal - lockedDirect;
-    
-    uint256 maxDebt = (availableCollateral * p.immutableConfig.depositorLTVBps) / 10_000;
-    return newDebt <= maxDebt;
+    uint256 maxBorrowable = (newPrincipal * ltvBps) / 10_000;
+    return newDebt <= maxBorrowable;
 }
 ```
 
@@ -1627,13 +1749,14 @@ function calculateDirectInterest(
 1. `sum(userPrincipal[all users]) == totalDeposits` (per pool)
 2. `feeIndex` never decreases (monotone)
 3. `trackedBalance >= sum(all obligations)` (per pool)
-4. `userPrincipal[user] >= sum(directLockedPrincipal + directOfferEscrow)` (per pool)
+4. `LibEncumbrance.total(positionKey, poolId) <= userPrincipal[positionKey]` (per position, per pool)
 
 **Per-Position Invariants**:
 1. `totalDebt <= (availableCollateral * depositorLTVBps) / 10000`
 2. `rollingLoan.principalRemaining <= rollingLoan.principal`
 3. `fixedLoan.principalRemaining <= fixedLoan.principal`
 4. `activeFixedLoanCount == userFixedLoanIds.length`
+5. `LibEncumbrance.total(positionKey, poolId) <= userPrincipal[positionKey]` (total encumbrance cannot exceed principal)
 
 **Pool Isolation Invariants**:
 1. Operations on pool A never modify pool B state
@@ -1759,7 +1882,7 @@ event ManagerRenounced(uint256 indexed pid, address indexed formerManager);
 2. **Solvency Preservation**: All operations maintain solvency constraints
 3. **Pool Isolation**: Operations on one pool don't affect others
 4. **Principal Conservation**: `sum(userPrincipal) == totalDeposits`
-5. **Direct Capacity**: `directLocked + directOfferEscrow <= userPrincipal`
+5. **Encumbrance Capacity**: `LibEncumbrance.total(positionKey, poolId) <= userPrincipal`
 6. **Penalty Correctness**: Penalty distribution sums correctly
 
 ### 9.3 Critical Test Scenarios
@@ -1885,12 +2008,10 @@ event ManagerRenounced(uint256 indexed pid, address indexed formerManager);
 
 **Unmanaged Pool Creation**:
 ```solidity
-ImmutablePoolConfig memory config = ImmutablePoolConfig({
+PoolConfig memory config = PoolConfig({
     // Self-secured pool loans do not charge interest; these fields are currently informational.
     rollingApyBps: 0,
-    rollingApyBpsExternal: 0,
     depositorLTVBps: 8000,            // 80% LTV
-    externalBorrowCRBps: 15000,       // 150% CR (used for external collateral paths)
     maintenanceRateBps: 100,          // 1% annual
     flashLoanFeeBps: 9,               // 0.09%
     flashLoanAntiSplit: true,
@@ -1925,9 +2046,7 @@ uint256 poolId = PoolManagementFacet(diamond).initPool{value: poolCreationFee}(
 ```solidity
 ManagedPoolConfig memory config = ManagedPoolConfig({
     rollingApyBps: 0,
-    rollingApyBpsExternal: 0,
     depositorLTVBps: 8000,
-    externalBorrowCRBps: 15000,
     maintenanceRateBps: 100,
     flashLoanFeeBps: 9,
     flashLoanAntiSplit: true,
@@ -2032,6 +2151,11 @@ DirectRollingConfig memory rollingConfig = DirectRollingConfig({
 - **Curve Commitment**: Hash of the full curve descriptor, updated on each generation change
 - **Flash Accounting**: Deferred ledger update model where userPrincipal and userFeeIndex are not updated during intermediate states
 - **Encumbered Balance**: Principal flagged as backing a derivative, preventing withdrawal but continuing to accrue fees
+- **LibEncumbrance**: Centralized library for all encumbrance tracking (directLocked, directLent, directOfferEscrow, indexEncumbered) per position and pool
+- **LibNetEquity**: Pure helper library for fee base calculations (same-asset, cross-asset, P2P borrower)
+- **LibFeeIndex**: Fee index accounting library (1e18 scale) for yield distribution
+- **LibSolvencyChecks**: Shared utilities for deterministic solvency and debt calculations
+- **LibIndexEncumbrance**: Thin wrapper around LibEncumbrance for index-specific encumbrance operations
 
 ### A.2 Formula Reference
 
@@ -2451,16 +2575,17 @@ treasuryFee = feeAmount - makerFee - indexFee;
 // Treasury receives: treasuryFee (transferred out)
 ```
 
-**Collateral Locking**:
+**Collateral Locking** (via centralized `LibEncumbrance`):
 ```solidity
-// On curve creation - lock base asset
-ds.directLockedPrincipal[positionKey][basePoolId] += maxVolume;
+// On curve creation - lock base asset via LibEncumbrance
+LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, basePoolId);
+enc.directLocked += maxVolume;
 
 // On fill - unlock filled amount
-ds.directLockedPrincipal[positionKey][basePoolId] -= baseFill;
+enc.directLocked -= baseFill;
 
 // On cancel - unlock remaining volume
-ds.directLockedPrincipal[positionKey][basePoolId] -= remainingVolume;
+enc.directLocked -= remainingVolume;
 ```
 
 **Generation-Based Updates**:
@@ -2485,29 +2610,66 @@ ds.directLockedPrincipal[positionKey][basePoolId] -= remainingVolume;
 
 ### 11.3 Collateral Locking Model
 
-**AMM Reserves** (via `directLentPrincipal`):
-```solidity
-// Lock - reserves continue earning fee index
-ds.directLentPrincipal[positionKey][poolId] += amount;
+All encumbrance operations are centralized in `LibEncumbrance`, providing a unified storage and API:
 
-// Unlock on finalization
-ds.directLentPrincipal[positionKey][poolId] -= amount;
+**Encumbrance Structure**:
+```solidity
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked (options, futures, MAM, borrower collateral)
+    uint256 directLent;         // AMM reserves (continues earning fee index)
+    uint256 directOfferEscrow;  // Escrowed offers
+    uint256 indexEncumbered;    // Principal backing index tokens
+}
 ```
 
-**Options/Futures/MAM Collateral** (via `directLockedPrincipal`):
+**AMM Reserves** (via `LibEncumbrance.directLent`):
+```solidity
+// Lock - reserves continue earning fee index
+LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, poolId);
+enc.directLent += amount;
+
+// Unlock on finalization
+enc.directLent -= amount;
+```
+
+**Options/Futures/MAM Collateral** (via `LibEncumbrance.directLocked`):
 ```solidity
 // Lock - prevents withdrawal, excluded from LTV
-ds.directLockedPrincipal[positionKey][poolId] += amount;
+LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, poolId);
+enc.directLocked += amount;
 
 // Unlock on exercise/settlement/reclaim/fill/cancel
-ds.directLockedPrincipal[positionKey][poolId] -= amount;
+enc.directLocked -= amount;
+```
+
+**Index Encumbrance** (via `LibIndexEncumbrance` wrapper):
+```solidity
+// Lock principal for index token backing
+LibIndexEncumbrance.encumber(positionKey, poolId, indexId, amount);
+
+// Unlock on index token burn
+LibIndexEncumbrance.unencumber(positionKey, poolId, indexId, amount);
+
+// Query encumbrance
+uint256 total = LibIndexEncumbrance.getEncumbered(positionKey, poolId);
+uint256 forIndex = LibIndexEncumbrance.getEncumberedForIndex(positionKey, poolId, indexId);
+```
+
+**Total Encumbrance Query**:
+```solidity
+// Get all encumbrance components in a single call
+LibEncumbrance.Encumbrance memory enc = LibEncumbrance.get(positionKey, poolId);
+uint256 totalEncumbered = enc.directLocked + enc.directLent + enc.directOfferEscrow + enc.indexEncumbered;
+
+// Or use the convenience function
+uint256 totalEncumbered = LibEncumbrance.total(positionKey, poolId);
 ```
 
 **Solvency Integration**:
-- `directLockedPrincipal` subtracted from available collateral for LTV calculations
-- `directLentPrincipal` treated as encumbered but continues earning fee index
-- Both prevent withdrawal of the encumbered amount
-- MAM curves use `directLockedPrincipal` for base asset locking
+- All encumbrance components are subtracted from available collateral for LTV calculations
+- `directLent` (AMM reserves) continues earning fee index while encumbered
+- All encumbrance types prevent withdrawal of the encumbered amount
+- MAM curves use `directLocked` for base asset locking
 
 ### 11.4 Oracle-Free Solvency Guarantees
 

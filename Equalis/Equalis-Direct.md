@@ -1,6 +1,6 @@
-# Equalis Direct: Bilateral Instruments and Yield-Bearing Limit Orders
+# Equalis Direct - P2P Lending Design Document
 
-**Version:** 3.0  
+**Version:** 3.1 (Updated for centralized encumbrance and fee index systems)  
 
 ---
 
@@ -10,27 +10,21 @@
 2. [Architecture](#architecture)
 3. [Term Loans](#term-loans)
 4. [Rolling Loans](#rolling-loans)
-5. [Yield-Bearing Limit Orders](#yield-bearing-limit-orders)
-6. [Active Credit Index System](#active-credit-index-system)
-7. [Data Models](#data-models)
-8. [Fee Distribution](#fee-distribution)
-9. [Error Handling](#error-handling)
-10. [Events](#events)
-11. [Testing Strategy](#testing-strategy)
+5. [Active Credit Index System](#active-credit-index-system)
+6. [Data Models](#data-models)
+7. [Fee Distribution](#fee-distribution)
+8. [Error Handling](#error-handling)
+9. [Events](#events)
+10. [Testing Strategy](#testing-strategy)
 
 ---
 
 ## 1. Overview
 
-Equalis Direct is a P2P lending system that enables bilateral loans between Position NFT holders. Direct supports bilateral instruments and spot execution. Some offers create agreements, some execute spot transfers without agreement creation.
-
-The system supports three main offer types:
+Equalis Direct is a P2P lending system that enables bilateral loans between Position NFT holders. The system supports two loan types:
 
 - **Term Loans**: Fixed-duration loans with upfront interest payment and optional early exercise
 - **Rolling Loans**: Periodic payment loans with arrears tracking and optional amortization
-- **Yield-Bearing Limit Orders (YBLOs)**: Trading orders with direct asset transfers (no agreement creation)
-
-Yield-Bearing Limit Orders (YBLOs) are Direct offers designed for spot trading funded by encumbered pool balances.
 
 ### Key Design Principles
 
@@ -44,16 +38,16 @@ Yield-Bearing Limit Orders (YBLOs) are Direct offers designed for spot trading f
 
 ### Loan Type Comparison
 
-| Feature | Term Loans | Rolling Loans | Yield Bearing Limit Orders |
-|---------|------------|---------------|--------------|
-| Duration | Fixed term | Open-ended with payment cap | No duration (instant fill) |
-| Interest | Upfront payment | Periodic accrual | Flat fee on fill |
-| Payments | Single repayment | Periodic payments | Direct transfer |
-| Amortization | No | Optional | N/A |
-| Early Exercise | Optional | Optional | N/A |
-| Grace Period | 24 hours after due | Configurable | N/A |
-| Arrears | N/A | Tracked and accumulated | N/A |
-| Agreement Created | Yes | Yes | No |
+| Feature | Term Loans | Rolling Loans |
+|---------|------------|---------------|
+| Duration | Fixed term | Open-ended with payment cap |
+| Interest | Upfront payment | Periodic accrual |
+| Payments | Single repayment | Periodic payments |
+| Amortization | No | Optional |
+| Early Exercise | Optional | Optional |
+| Grace Period | 24 hours after due | Configurable |
+| Arrears | N/A | Tracked and accumulated |
+| Agreement Created | Yes | Yes |
 
 ---
 
@@ -106,24 +100,33 @@ Yield-Bearing Limit Orders (YBLOs) are Direct offers designed for spot trading f
 The system integrates with existing Equalis infrastructure:
 
 1. **Position NFT System**: Validates ownership and retrieves position keys
-2. **Solvency Checks**: Includes per-pool directLentPrincipal as debt-like exposure
-3. **Withdrawal Logic**: Enforces per-pool directLockedPrincipal + directLentPrincipal constraints
-4. **FeeIndex System**: Distributes platform fee shares to appropriate pools
-5. **Active Credit Index**: Time-gated subsidies for P2P lenders and same-asset borrowers
-6. **Treasury System**: Routes protocol fee shares to configured treasury
-7. **Liquidation Protection**: Pool liquidations respect locked collateral and escrowed offers
+2. **Solvency Checks**: Uses `LibEncumbrance.total()` to include all encumbered principal as debt-like exposure
+3. **Withdrawal Logic**: Enforces encumbrance constraints via `LibSolvencyChecks.calculateAvailablePrincipal()`
+4. **FeeIndex System**: Distributes platform fee shares via `LibFeeIndex.accrueWithSource()`
+5. **Active Credit Index**: Time-gated subsidies via `LibActiveCreditIndex.accrueWithSource()` for P2P lenders and same-asset borrowers
+6. **Treasury System**: Routes protocol fee shares to configured treasury via `LibFeeTreasury`
+7. **Liquidation Protection**: Pool liquidations respect locked collateral and escrowed offers via LibEncumbrance
 8. **Position Transfer Guard**: NFT transfer hook cancels outstanding Direct offers
+9. **Encumbrance System**: Centralized tracking via `LibEncumbrance` for all position locks
 
 ### Per-Pool Exposure Isolation
 
-All Direct exposure is tracked **per pool**, providing enhanced isolation:
+All Direct exposure is tracked **per pool** through the centralized `LibEncumbrance` library, providing enhanced isolation:
 
 ```solidity
-// Per-pool tracking
-directLockedPrincipal[positionKey][poolId]   // Collateral locked in specific pool
-directLentPrincipal[positionKey][poolId]     // Principal lent from specific pool
-directBorrowedPrincipal[positionKey][poolId] // Principal borrowed into specific pool
-directOfferEscrow[positionKey][poolId]       // Escrowed offers for specific pool
+// Centralized encumbrance storage (LibEncumbrance.sol)
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked in specific pool
+    uint256 directLent;         // Principal actively lent from specific pool
+    uint256 directOfferEscrow;  // Escrowed offers for specific pool
+    uint256 indexEncumbered;    // Principal encumbered by index positions
+}
+
+// Access pattern
+LibEncumbrance.position(positionKey, poolId).directLocked
+LibEncumbrance.position(positionKey, poolId).directLent
+LibEncumbrance.position(positionKey, poolId).directOfferEscrow
+LibEncumbrance.total(positionKey, poolId)  // Sum of all encumbrance types
 ```
 
 **Benefits**:
@@ -131,6 +134,7 @@ directOfferEscrow[positionKey][poolId]       // Escrowed offers for specific poo
 - Enhanced solvency precision with pool-specific constraints
 - Improved liquidity management
 - Cross-pool safety (issues in one pool don't affect others)
+- Unified encumbrance tracking across Direct lending and Index positions
 
 ---
 
@@ -276,7 +280,7 @@ function postOffer(DirectOfferParams calldata params) external returns (uint256 
 ```
 - Validate Position NFT ownership and offer parameters
 - Verify lender has sufficient available principal
-- Reserve principal: `directOfferEscrow[lenderKey][lenderPoolId] += principal`
+- Reserve principal via LibEncumbrance: `enc.directOfferEscrow += principal`
 - Store offer and emit events
 
 #### 2. Post Borrower Offer
@@ -285,7 +289,7 @@ function postBorrowerOffer(DirectBorrowerOfferParams calldata params) external r
 ```
 - Validate Position NFT ownership and offer parameters
 - Verify borrower has sufficient collateral
-- Lock collateral: `directLockedPrincipal[borrowerKey][collateralPoolId] += collateralLockAmount`
+- Lock collateral via LibEncumbrance: `enc.directLocked += collateralLockAmount`
 - Store offer and emit events
 
 #### 3. Accept Lender Offer
@@ -293,7 +297,7 @@ function postBorrowerOffer(DirectBorrowerOfferParams calldata params) external r
 function acceptOffer(uint256 offerId, uint256 borrowerPositionId) external returns (uint256 agreementId);
 ```
 - Validate borrower Position NFT and collateral availability
-- Lock collateral: `directLockedPrincipal[borrowerKey][collateralPoolId] += collateralLockAmount`
+- Lock collateral via LibEncumbrance: `enc.directLocked += collateralLockAmount`
 - Calculate and collect upfront interest and platform fees
 - Reduce lender principal immediately: `lenderPrincipal -= lentAmount`
 - Transfer principal from pool to borrower
@@ -399,7 +403,7 @@ struct DirectTrancheOfferParams {
 ```
 
 **Mechanics**:
-- Full tranche escrowed at post time into `directOfferEscrow`
+- Full tranche escrowed at post time via LibEncumbrance
 - `trancheRemaining` tracks unfilled balance
 - Acceptances decrement `trancheRemaining` by `principal`
 - Insufficient tranche auto-cancels the offer
@@ -578,7 +582,7 @@ function postRollingOffer(DirectRollingOfferParams calldata params) external ret
 ```
 - Validate Position NFT ownership and parameters against config bounds
 - Verify lender has sufficient available principal
-- Escrow principal: `directOfferEscrow[lenderKey][lenderPoolId] += principal`
+- Escrow principal via LibEncumbrance: `enc.directOfferEscrow += principal`
 - Store offer and emit events
 
 #### 2. Post Borrower Offer
@@ -586,7 +590,7 @@ function postRollingOffer(DirectRollingOfferParams calldata params) external ret
 function postBorrowerRollingOffer(DirectRollingBorrowerOfferParams calldata params) external returns (uint256 offerId);
 ```
 - Validate Position NFT ownership and collateral availability
-- Lock collateral: `directLockedPrincipal[borrowerKey][collateralPoolId] += collateralLockAmount`
+- Lock collateral via LibEncumbrance: `enc.directLocked += collateralLockAmount`
 - Store offer and emit events
 
 #### 3. Accept Offer
@@ -718,226 +722,47 @@ struct RollingExposure {
 
 ---
 
-## 5. Yield Bearing Limit Orders (YBLO)
+## 5. Active Credit Index System
 
 ### Overview
 
-YBLO's provide a trading mechanism that encumbers capital at a specified price ratio without creating agreements. Fills resolve via direct asset transfers rather than agreement creation, providing a gas-efficient trading path where capital remains on platform earning fee index yield while waiting for fills.
-
-### Key Features
-
-- **No Agreement Creation**: Fills transfer assets directly between maker and taker positions
-- **Partial Fills**: Orders support multiple partial fills down to a configurable minimum
-- **Capital Efficiency**: Encumbered capital continues earning fee index yield while waiting for fills
-- **Lightweight Fees**: Flat basis points fee on filled amount (no APR/duration calculation)
-- **Bilateral Trading**: Both lenders and borrowers can post YBLO's
-- **Solvency Integration**: Encumbered amounts included in LTV calculations for other offer types
-
-### Data Structures
-
-```solidity
-struct LimitOrder {
-    uint256 orderId;
-    address owner;
-    uint256 positionId;
-    uint256 makerPoolId;           // Pool for maker-side asset
-    address borrowAsset;
-    address collateralAsset;
-    uint256 priceNumerator;        // collateral = principal * num / denom
-    uint256 priceDenominator;
-    uint256 cap;                   // Total amount available for fills
-    uint256 remaining;             // Unfilled amount
-    uint256 minFill;               // Minimum fill amount
-    bool isBorrowerSide;           // true = borrower posting collateral
-    bool active;                   // Order can be filled
-    bool cancelled;                // Order was cancelled
-}
-
-struct LimitOrderParams {
-    uint256 positionId;
-    uint256 makerPoolId;
-    address borrowAsset;
-    address collateralAsset;
-    uint256 priceNumerator;
-    uint256 priceDenominator;
-    uint256 cap;
-    uint256 minFill;
-    bool isBorrowerSide;
-}
-
-struct LimitOrderConfig {
-    uint16 feeBps;                 // Flat fee in basis points
-    uint16 treasuryFeeBps;         // Portion of fee sent to treasury
-    address treasury;              // Treasury recipient
-}
-```
-
-### Lifecycle
-
-#### 1. Post YBLO
-```solidity
-function postLimitOrder(LimitOrderParams calldata params) external returns (uint256 orderId);
-```
-- Validate Position NFT ownership and offer parameters
-- Verify maker pool and assets exist and match
-- Check available principal vs existing encumbrance
-- Increase encumbrance by cap amount (reuses existing directOfferEscrow/directLockedPrincipal mappings)
-- Store order with remaining = cap, active = true
-- Emit `LimitOrderPosted` event
-
-#### 2. Accept YBLO
-```solidity
-function acceptLimitOrder(uint256 orderId, uint256 takerPositionId, uint256 takerPoolId, uint256 fillAmount) external;
-```
-- Validate order is active and not cancelled
-- Validate fillAmount within [minFill, remaining]
-- Validate taker pool asset matches counterparty asset
-- Compute counterparty amount using price ratio
-- Reduce encumbrance by fill amount
-- Apply lightweight fee (deducted from taker's received amount)
-- Transfer assets between maker and taker positions
-- Mark order filled if remaining == 0
-- Emit `LimitOrderFilled` event
-
-#### 3. Cancel YBLO
-```solidity
-function cancelLimitOrder(uint256 orderId) external;
-```
-- Verify caller is order owner
-- Release remaining encumbrance
-- Mark order cancelled and inactive
-- Emit `LimitOrderCancelled` event
-
-### Price Ratio Mechanics
-
-The price ratio determines the exchange rate between assets:
-
-- **Lender-side orders** (`isBorrowerSide = false`): Maker posts principal, receives collateral
-  - `collateralReceived = fillAmount * priceNumerator / priceDenominator`
-  
-- **Borrower-side orders** (`isBorrowerSide = true`): Maker posts collateral, receives principal
-  - `principalReceived = fillAmount * priceDenominator / priceNumerator`
-
-### Fee System
-
-YBLO's use a dedicated lightweight fee system:
-
-```solidity
-// Fee calculation
-feeAmount = fillAmount * feeBps / 10000
-
-// Fee is deducted from taker's received amount
-takerReceives = counterpartyAmount - feeAmount
-
-// Fee split between treasury and fee index
-treasuryShare = feeAmount * treasuryFeeBps / 10000
-feeIndexShare = feeAmount - treasuryShare
-```
-
-### Encumbrance Integration
-
-YBLO's reuse existing encumbrance mappings to ensure capital earns fee index yield:
-
-- **Lender-side orders**: Use `directOfferEscrow[positionKey][makerPoolId]`
-- **Borrower-side orders**: Use `directLockedPrincipal[positionKey][makerPoolId]`
-
-This ensures:
-1. Encumbered capital continues earning fee index yield
-2. Solvency checks automatically include YBLO encumbrance
-3. No new storage mappings needed
-
-### Position Transfer Handling
-
-When a position NFT is transferred:
-- All outstanding YBLO's for that position are automatically cancelled
-- All encumbered amounts are released
-- `LimitOrderCancelled` events emitted with `Transfer` reason
-
-### View Functions
-
-```solidity
-function getLimitOrder(uint256 orderId) external view returns (LimitOrder memory);
-function getLimitOrdersByPosition(bytes32 positionKey, uint256 offset, uint256 limit) 
-    external view returns (uint256[] memory orderIds, uint256 total);
-function getActiveLimitOrders(uint256 offset, uint256 limit)
-    external view returns (uint256[] memory orderIds, uint256 total);
-function getLimitOrderEncumbrance(bytes32 positionKey, uint256 poolId) 
-    external view returns (uint256);
-```
-
-### Events
-
-```solidity
-event LimitOrderPosted(
-    uint256 indexed orderId,
-    address indexed owner,
-    uint256 indexed positionId,
-    uint256 makerPoolId,
-    address borrowAsset,
-    address collateralAsset,
-    uint256 priceNumerator,
-    uint256 priceDenominator,
-    uint256 cap,
-    uint256 minFill,
-    bool isBorrowerSide
-);
-
-event LimitOrderFilled(
-    uint256 indexed orderId,
-    address indexed taker,
-    uint256 indexed takerPositionId,
-    uint256 takerPoolId,
-    uint256 fillAmount,
-    uint256 counterpartyAmount,
-    uint256 remaining,
-    uint256 feeAmount
-);
-
-event LimitOrderCancelled(
-    uint256 indexed orderId,
-    uint256 releasedAmount,
-    LimitOrderCancelReason reason  // Manual or Transfer
-);
-
-enum LimitOrderCancelReason {
-    Manual,
-    Transfer
-}
-```
-
-### Use Cases
-
-- **Spot Trading**: Direct asset exchange at specified ratios without loan agreements
-- **Capital Parking**: Earn yield while waiting for favorable fill prices
-- **Order Book Trading**: CLOB-style trading dynamics with partial fills
-- **Gas Efficiency**: Lower gas costs compared to agreement-based flows
-
-**Spot Offer Definition**: Spot offer acceptance executes direct transfers and does not create an agreement object. This enables immediate settlement without ongoing obligations between parties.
-
----
-
-## 6. Active Credit Index System
-
-### Overview
-
-The Active Credit Index extends the fee index system to provide time-gated subsidies to active credit participants. This creates additional yield for P2P lenders and same-asset borrowers.
+The Active Credit Index extends the fee index system to provide time-gated subsidies to active credit participants. This creates additional yield for P2P lenders and same-asset borrowers. The system is centralized in `LibActiveCreditIndex.sol` and operates in parallel with the main fee index.
 
 ### Participants
 
-- **P2P Lenders**: Earn rewards on `directLentPrincipal` (all asset types)
+- **P2P Lenders**: Earn rewards on `directLent` principal (all asset types)
 - **Same-Asset Borrowers**: Earn rewards on same-asset debt (rolling, fixed, direct P2P)
 
 ### Time Gate Mechanism
 
-A 24-hour maturity requirement prevents gaming:
+A 24-hour maturity requirement prevents gaming. The system uses hourly bucket scheduling for efficient maturity tracking:
 
 ```solidity
+// Constants
+uint256 public constant TIME_GATE = 24 hours;
+uint256 internal constant BUCKET_SIZE = 1 hours;
+uint8 internal constant BUCKET_COUNT = 24;
+
 // Time credit calculation
 timeCredit = min(24 hours, currentTime - startTime)
 
-// Active weight determination
+// Active weight determination (only mature positions earn rewards)
 activeWeight = timeCredit >= 24 hours ? principal : 0
 ```
+
+### Bucket-Based Maturity Scheduling
+
+The system uses a ring buffer of 24 hourly buckets to efficiently track pending principal:
+
+```solidity
+// Pool-level tracking
+uint256 activeCreditMaturedTotal;           // Sum of all matured principal
+uint64 activeCreditPendingStartHour;        // Start hour for bucket ring
+uint8 activeCreditPendingCursor;            // Current bucket cursor
+uint256[24] activeCreditPendingBuckets;     // Pending principal by maturity hour
+```
+
+When principal is added, it's scheduled into the appropriate future bucket. As time passes, buckets are rolled into `activeCreditMaturedTotal` for reward eligibility.
 
 ### Weighted Dilution
 
@@ -963,16 +788,15 @@ struct ActiveCreditState {
     uint256 indexSnapshot;  // Last settled activeCreditIndex value
 }
 
-// Extended PoolData
-struct PoolData {
-    // ... existing fields ...
-    uint256 activeCreditIndex;
-    uint256 activeCreditIndexRemainder;
-    uint256 activeCreditPrincipalTotal;
-    
+// Per-pool tracking in PoolData
+uint256 activeCreditIndex;              // Global active credit index
+uint256 activeCreditIndexRemainder;     // Remainder for precision
+uint256 activeCreditPrincipalTotal;     // Sum of active credit principal
+uint256 activeCreditMaturedTotal;       // Matured principal base for accruals
+
+// Per-user state
 mapping(bytes32 => ActiveCreditState) userActiveCreditStateP2P;
 mapping(bytes32 => ActiveCreditState) userActiveCreditStateDebt;
-}
 ```
 
 ### Fee Sources
@@ -981,18 +805,29 @@ Active Credit Index is funded by:
 - Platform fees from Direct lending (configurable split)
 - Default recovery fees from Direct lending (configurable split)
 
-**Note**: Accrual only produces rewards when the destination pool has non-zero `activeCreditPrincipalTotal`.
+**Note**: Accrual only produces rewards when the destination pool has non-zero `activeCreditMaturedTotal`.
 
 ### Settlement
 
 ```solidity
-function settle(uint256 pid, address user) internal {
-    // 1. Settle existing feeIndex
-    LibFeeIndex.settle(pid, user);
+function settle(uint256 pid, bytes32 user) internal {
+    // 1. Roll matured buckets into activeCreditMaturedTotal
+    _rollMatured(p);
     
-    // 2. Settle Active Credit Index
-    LibActiveCreditIndex.settle(pid, user);
+    // 2. Settle P2P lender state
+    _settleState(p, p.userActiveCreditStateP2P[user], pid, user);
+    
+    // 3. Settle debt state
+    _settleState(p, p.userActiveCreditStateDebt[user], pid, user);
 }
+```
+
+### Key Events
+
+```solidity
+event ActiveCreditIndexAccrued(uint256 indexed pid, uint256 amount, uint256 delta, uint256 newIndex, bytes32 source);
+event ActiveCreditSettled(uint256 indexed pid, bytes32 indexed user, uint256 prevIndex, uint256 newIndex, uint256 addedYield, uint256 totalAccruedYield);
+event ActiveCreditTimingUpdated(uint256 indexed pid, bytes32 indexed user, bool isDebtState, uint40 startTime, uint256 principal, bool isMature);
 ```
 
 ### Minimum Interest Duration
@@ -1006,7 +841,7 @@ Protects against short-duration wash trading:
 
 ---
 
-## 7. Data Models
+## 6. Data Models
 
 ### Configuration
 
@@ -1033,6 +868,40 @@ struct DirectRollingConfig {
     uint16 defaultPenaltyBps;
     uint64 minPaymentWei;
 }
+```
+
+### Centralized Encumbrance Storage
+
+All position encumbrance is managed through `LibEncumbrance.sol`:
+
+```solidity
+// Storage structure
+struct EncumbranceStorage {
+    mapping(bytes32 => mapping(uint256 => Encumbrance)) encumbrance;
+    mapping(bytes32 => mapping(uint256 => mapping(uint256 => uint256))) encumberedByIndex;
+}
+
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked for Direct loans
+    uint256 directLent;         // Principal actively lent out
+    uint256 directOfferEscrow;  // Principal escrowed for pending offers
+    uint256 indexEncumbered;    // Principal encumbered by index positions
+}
+```
+
+### Centralized Fee Index Storage
+
+Fee index tracking is managed through `LibFeeIndex.sol` with per-pool storage in `PoolData`:
+
+```solidity
+// Per-pool fee index state
+uint256 feeIndex;                   // Global pool fee index (1e18 scale)
+uint256 feeIndexRemainder;          // Per-pool remainder for precision
+uint256 yieldReserve;               // Backing reserve for accrued yield claims
+
+// Per-user checkpoints
+mapping(bytes32 => uint256) userFeeIndex;       // User's last settled fee index
+mapping(bytes32 => uint256) userAccruedYield;   // Accumulated yield ledger
 ```
 
 ### Storage Layout
@@ -1066,12 +935,14 @@ struct DirectStorage {
     uint256 nextRollingBorrowerOfferId;
     uint256 nextRollingAgreementId;
     
-    // Position state (per pool)
-mapping(bytes32 => mapping(uint256 => uint256)) directLockedPrincipal;
-mapping(bytes32 => mapping(uint256 => uint256)) directLentPrincipal;
-mapping(bytes32 => mapping(uint256 => uint256)) directBorrowedPrincipal;
-mapping(bytes32 => mapping(uint256 => uint256)) directOfferEscrow;
-mapping(bytes32 => mapping(address => uint256)) directSameAssetDebt;
+    // Position state tracked via LibEncumbrance (centralized)
+    // Access: LibEncumbrance.position(positionKey, poolId).directLocked
+    // Access: LibEncumbrance.position(positionKey, poolId).directLent
+    // Access: LibEncumbrance.position(positionKey, poolId).directOfferEscrow
+    
+    // Additional Direct-specific tracking
+    mapping(bytes32 => mapping(uint256 => uint256)) directBorrowedPrincipal;
+    mapping(bytes32 => mapping(address => uint256)) directSameAssetDebt;
     
     // Pool-level tracking
     mapping(uint256 => uint256) activeDirectLentPerPool;
@@ -1092,22 +963,30 @@ mapping(bytes32 => mapping(address => uint256)) directSameAssetDebt;
 
 ### Position State
 
+Position encumbrance is accessed through the centralized `LibEncumbrance` library:
+
 ```solidity
 struct PositionDirectState {
-    uint256 directLockedPrincipal;   // Collateral locked in pool
-    uint256 directLentPrincipal;     // Principal lent from pool (includes escrow)
+    uint256 directLockedPrincipal;   // From LibEncumbrance.directLocked
+    uint256 directLentPrincipal;     // From LibEncumbrance.directLent + directOfferEscrow
 }
 
 // View function returns per-pool state
 function getPositionDirectState(uint256 positionId, uint256 poolId) 
-    external view returns (uint256 locked, uint256 lent);
+    external view returns (uint256 locked, uint256 lent) {
+    bytes32 positionKey = nft.getPositionKey(positionId);
+    LibEncumbrance.Encumbrance memory enc = LibEncumbrance.get(positionKey, poolId);
+    return (enc.directLocked, enc.directLent + enc.directOfferEscrow);
+}
 ```
 
 ---
 
-## 8. Fee Distribution
+## 7. Fee Distribution
 
 ### Platform Fee Split (4-Way)
+
+Fee distribution uses `LibFeeIndex.accrueWithSource()` for pool-wide yield distribution:
 
 ```solidity
 function _distributeDirectFees(uint256 platformFee, DirectConfig storage cfg) internal {
@@ -1116,7 +995,10 @@ function _distributeDirectFees(uint256 platformFee, DirectConfig storage cfg) in
     uint256 activeCreditShare = (platformFee * cfg.platformSplitActiveCreditIndexBps) / 10_000;
     uint256 protocolShare = platformFee - lenderShare - feeIndexShare - activeCreditShare;
     
-    // Distribute to respective destinations
+    // FeeIndex share distributed via LibFeeIndex.accrueWithSource()
+    // Active Credit share distributed via LibActiveCreditIndex.accrueWithSource()
+    // Protocol share sent to treasury
+    // Lender share added to lender's accrued yield
 }
 ```
 
@@ -1149,13 +1031,20 @@ function _annualizedInterestAmount(uint256 principal, uint256 aprBps, uint256 du
 - On loan acceptance: `lenderPrincipal -= lentAmount`
 - On repayment: `lenderPrincipal += repaidAmount`
 
+**Encumbrance Updates** (via LibEncumbrance):
+- Offer posted: `enc.directOfferEscrow += escrowAmount`
+- Offer accepted: `enc.directOfferEscrow -= principal; enc.directLent += principal`
+- Offer cancelled: `enc.directOfferEscrow -= releaseAmount`
+- Loan repaid: `enc.directLent -= principal; enc.directLocked -= collateral`
+- Collateral locked: `enc.directLocked += collateralAmount`
+
 **Borrower Fee Base** (normalized to prevent recursive fee inflation):
 - Same-Asset P2P: `feeBase = max(0, collateralPrincipal - sameAssetP2PDebt)`
 - Cross-Asset P2P: `feeBase = lockedCollateral + unlockedPrincipal`
 
 ---
 
-## 9. Error Handling
+## 8. Error Handling
 
 ### Direct-Specific Errors
 
@@ -1207,7 +1096,7 @@ function _pullExact(address token, uint256 amount) internal {
 
 ---
 
-## 10. Events
+## 9. Events
 
 ### Term Loan Events
 
@@ -1517,7 +1406,7 @@ event ActiveCreditIndexAccrued(
 
 event ActiveCreditSettled(
     uint256 indexed pid, 
-    address indexed user, 
+    bytes32 indexed user, 
     uint256 prevIndex, 
     uint256 newIndex, 
     uint256 addedYield, 
@@ -1526,7 +1415,7 @@ event ActiveCreditSettled(
 
 event ActiveCreditTimingUpdated(
     uint256 indexed pid,
-    address indexed user,
+    bytes32 indexed user,
     bool isDebtState,
     uint40 startTime,
     uint256 principal,
@@ -1534,9 +1423,52 @@ event ActiveCreditTimingUpdated(
 );
 ```
 
+### Encumbrance Events
+
+```solidity
+event EncumbranceIncreased(
+    bytes32 indexed positionKey,
+    uint256 indexed poolId,
+    uint256 indexed indexId,
+    uint256 amount,
+    uint256 totalEncumbered,
+    uint256 indexEncumbered
+);
+
+event EncumbranceDecreased(
+    bytes32 indexed positionKey,
+    uint256 indexed poolId,
+    uint256 indexed indexId,
+    uint256 amount,
+    uint256 totalEncumbered,
+    uint256 indexEncumbered
+);
+```
+
+### Fee Index Events
+
+```solidity
+event FeeIndexAccrued(
+    uint256 indexed pid, 
+    uint256 amount, 
+    uint256 delta, 
+    uint256 newIndex, 
+    bytes32 source
+);
+
+event YieldSettled(
+    uint256 indexed pid,
+    bytes32 indexed user,
+    uint256 prevIndex,
+    uint256 newIndex,
+    uint256 addedYield,
+    uint256 totalAccruedYield
+);
+```
+
 ---
 
-## 11. Testing Strategy
+## 10. Testing Strategy
 
 ### Unit Testing
 
@@ -1563,13 +1495,13 @@ Property-based tests verify universal properties across all valid inputs using F
 **Core Properties**:
 
 1. **Ownership Validation**: All Direct operations require Position NFT ownership
-2. **Capacity Management**: `directLockedPrincipal + directLentPrincipal <= userPrincipal` per pool
+2. **Capacity Management**: `LibEncumbrance.total(positionKey, poolId) <= userPrincipal` per pool
 3. **Tranche Conservation**: `trancheRemaining + converted = trancheAmount`
 4. **Fee Distribution Accuracy**: Fee splits sum correctly with normalized fee base
 5. **State Consistency**: Cumulative exposure accurately reflects all active agreements
 6. **Lifecycle Integrity**: State transitions are atomic and update all related state
 7. **Timing Controls**: Repayment and exercise respect configured flags
-8. **Solvency Integration**: Per-pool directLentPrincipal treated as debt-like exposure
+8. **Solvency Integration**: Per-pool encumbrance (via LibEncumbrance) treated as debt-like exposure
 9. **Configuration Validation**: Basis point values sum correctly
 10. **Event Completeness**: All operations emit appropriate events
 
@@ -1613,7 +1545,7 @@ Integration tests verify:
 For any Direct operation, the caller must own the specified Position NFT.
 
 ### Property 2: Capacity Management
-For any Position NFT and pool, `directLockedPrincipal + directLentPrincipal <= userPrincipal`.
+For any Position NFT and pool, `LibEncumbrance.total(positionKey, poolId) <= userPrincipal`.
 
 ### Property 3: Tranche Conservation
 For tranche-backed offers, `trancheRemaining + converted = trancheAmount`.
@@ -1631,7 +1563,7 @@ State transitions are atomic and correctly update all related Position state.
 Repayment and exercise operations respect `allowEarlyRepay` and `allowEarlyExercise` flags.
 
 ### Property 8: Solvency Integration
-Per-pool `directLentPrincipal` is included as debt-like exposure in solvency checks.
+Per-pool `directLent` (from LibEncumbrance) is included as debt-like exposure in solvency checks.
 
 ### Property 9: Configuration Validation
 Platform splits sum to 10000, default splits sum to ≤10000.
@@ -1646,7 +1578,7 @@ Recovery only callable after grace period; repayment available during grace peri
 Lender principal immediately reduced on acceptance, restored on repayment.
 
 ### Property 13: Per-Pool Isolation
-Direct exposure tracked independently per pool with no cross-pool interference.
+Direct exposure tracked independently per pool via LibEncumbrance with no cross-pool interference.
 
 ### Property 14: Rolling Payment Order
 Payments apply to arrears first, then current interest, then principal (if allowed).
@@ -1656,4 +1588,4 @@ Active Credit rewards only accrue after 24-hour maturity with weighted dilution.
 
 ---
 
-**Document Version:** 5.0
+**Document Version:** 6.0

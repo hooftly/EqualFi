@@ -24,6 +24,9 @@ The derivatives system enables Position NFT holders to create options and future
 - **Transferable Rights**: Derivative rights are ERC-1155 tokens that can be freely traded
 - **No Oracles Required**: Strike/forward prices are fixed at creation, no price feeds needed
 - **European & American Styles**: Both exercise styles supported for options and futures
+- **Centralized Encumbrance**: Collateral tracked via unified `LibEncumbrance` system
+- **Centralized Fee Routing**: Fees distributed via `LibFeeRouter` (ACI/FI/Treasury)
+- **Custom Fees**: Series creators can specify custom fee rates within bounds
 
 ### System Participants
 
@@ -62,7 +65,7 @@ src/derivatives/
 ├── OptionToken.sol      # ERC-1155 for option rights
 └── FuturesToken.sol     # ERC-1155 for futures rights
 
-src/equallend-direct/
+src/derivatives/
 ├── OptionsFacet.sol     # Options creation, exercise, reclaim
 └── FuturesFacet.sol     # Futures creation, settlement, reclaim
 
@@ -72,7 +75,10 @@ src/views/
 src/libraries/
 ├── DerivativeTypes.sol       # Data structures
 ├── LibDerivativeStorage.sol  # Diamond storage
-└── LibDerivativeHelpers.sol  # Collateral locking utilities
+├── LibDerivativeHelpers.sol  # Collateral locking via LibEncumbrance
+├── LibDerivativeFees.sol     # Fee calculation and validation
+├── LibFeeTreasury.sol        # Fee routing to ACI/FI/Treasury
+└── LibEncumbrance.sol        # Centralized encumbrance tracking
 ```
 
 ### Storage Layout
@@ -109,6 +115,16 @@ struct DerivativeConfig {
     uint64 europeanToleranceSeconds;    // Window around expiry for European exercise
     uint64 defaultGracePeriodSeconds;   // Default grace period for futures reclaim
     uint16 maxFeeBps;                   // Maximum fee basis points
+    uint16 minFeeBps;                   // Minimum fee basis points
+    uint16 defaultCreateFeeBps;         // Default creation fee
+    uint16 defaultExerciseFeeBps;       // Default exercise/settlement fee
+    uint16 defaultReclaimFeeBps;        // Default reclaim fee
+    uint16 ammMakerShareBps;            // AMM maker fee share
+    uint16 communityMakerShareBps;      // Community auction maker share
+    uint16 mamMakerShareBps;            // MAM curve maker share
+    uint128 defaultCreateFeeFlatWad;    // Flat creation fee (1e18 scale)
+    uint128 defaultExerciseFeeFlatWad;  // Flat exercise fee (1e18 scale)
+    uint128 defaultReclaimFeeFlatWad;   // Flat reclaim fee (1e18 scale)
     bool requirePositionNFT;            // Whether Position NFT is required
 }
 ```
@@ -141,6 +157,9 @@ struct OptionSeries {
     uint256 totalSize;           // Total underlying amount
     uint256 remaining;           // Unexercised amount
     uint256 collateralLocked;    // Currently locked collateral
+    uint16 createFeeBps;         // Creation fee for this series
+    uint16 exerciseFeeBps;       // Exercise fee for this series
+    uint16 reclaimFeeBps;        // Reclaim fee for this series
     bool isCall;                 // true = call, false = put
     bool isAmerican;             // true = American, false = European
     bool reclaimed;              // Whether maker has reclaimed
@@ -169,17 +188,22 @@ struct CreateOptionSeriesParams {
     uint256 totalSize;         // Size in underlying units
     bool isCall;               // Call or put
     bool isAmerican;           // American or European style
+    bool useCustomFees;        // Use custom fee rates
+    uint16 createFeeBps;       // Custom creation fee (if useCustomFees)
+    uint16 exerciseFeeBps;     // Custom exercise fee (if useCustomFees)
+    uint16 reclaimFeeBps;      // Custom reclaim fee (if useCustomFees)
 }
 ```
 
 **What Happens:**
 1. Validates position ownership and pool membership
-2. Settles any pending fee/credit indexes
-3. Locks collateral:
+2. Settles any pending Fee Index and Active Credit Index
+3. Charges creation fee (routed via LibFeeRouter to ACI/FI/Treasury)
+4. Locks collateral via centralized LibEncumbrance:
    - Call: locks `totalSize` of underlying
    - Put: locks `strikePrice * totalSize` of strike asset (normalized)
-4. Creates series record with unique `seriesId`
-5. Mints `totalSize` ERC-1155 tokens to the Position NFT owner
+5. Creates series record with unique `seriesId`
+6. Mints `totalSize` ERC-1155 tokens to the Position NFT owner
 
 ### Exercising Options
 
@@ -266,6 +290,9 @@ struct FuturesSeries {
     uint256 totalSize;           // Total underlying amount
     uint256 remaining;           // Unsettled amount
     uint256 underlyingLocked;    // Currently locked underlying
+    uint16 createFeeBps;         // Creation fee for this series
+    uint16 exerciseFeeBps;       // Settlement fee for this series
+    uint16 reclaimFeeBps;        // Reclaim fee for this series
     uint64 graceUnlockTime;      // When maker can reclaim
     bool isEuropean;             // European or American style
     bool reclaimed;              // Whether maker has reclaimed
@@ -288,14 +315,20 @@ struct CreateFuturesSeriesParams {
     uint64 expiry;             // Settlement date
     uint256 totalSize;         // Size in underlying units
     bool isEuropean;           // European or American style
+    bool useCustomFees;        // Use custom fee rates
+    uint16 createFeeBps;       // Custom creation fee (if useCustomFees)
+    uint16 exerciseFeeBps;     // Custom settlement fee (if useCustomFees)
+    uint16 reclaimFeeBps;      // Custom reclaim fee (if useCustomFees)
 }
 ```
 
 **What Happens:**
 1. Validates position ownership and pool membership
-2. Locks `totalSize` of underlying asset
-3. Sets `graceUnlockTime = expiry + gracePeriod`
-4. Mints `totalSize` ERC-1155 tokens to Position NFT owner
+2. Settles any pending Fee Index and Active Credit Index
+3. Charges creation fee (routed via LibFeeRouter to ACI/FI/Treasury)
+4. Locks `totalSize` of underlying asset via centralized LibEncumbrance
+5. Sets `graceUnlockTime = expiry + gracePeriod`
+6. Mints `totalSize` ERC-1155 tokens to Position NFT owner
 
 ### Settling Futures
 
@@ -406,20 +439,30 @@ function uri(uint256 id) public view returns (string memory);
 
 ## Collateral Management
 
-### Locking Mechanism
+### Centralized Encumbrance System
 
-Collateral is tracked per-position, per-pool using the `directLockedPrincipal` mapping:
+Collateral is tracked through the centralized `LibEncumbrance` library, which maintains all encumbrance types per position and pool:
 
 ```solidity
-// In DirectStorage
-mapping(bytes32 => mapping(uint256 => uint256)) directLockedPrincipal;
-//       positionKey    poolId         lockedAmount
+// In LibEncumbrance
+struct Encumbrance {
+    uint256 directLocked;       // Collateral locked for derivatives/direct lending
+    uint256 directLent;         // Principal lent out (AMM reserves, direct lending)
+    uint256 directOfferEscrow;  // Principal escrowed for open offers
+    uint256 indexEncumbered;    // Principal encumbered for index tokens
+}
+
+struct EncumbranceStorage {
+    // positionKey => poolId => all encumbrance components
+    mapping(bytes32 => mapping(uint256 => Encumbrance)) encumbrance;
+}
 ```
 
 ### Available Principal Calculation
 
 ```
-available = userPrincipal - lockedPrincipal - lentPrincipal
+totalEncumbered = directLocked + directLent + directOfferEscrow + indexEncumbered
+available = userPrincipal - totalEncumbered
 ```
 
 A position can only create derivatives if it has sufficient unlocked principal.
@@ -427,11 +470,17 @@ A position can only create derivatives if it has sufficient unlocked principal.
 ### Lock/Unlock Functions
 
 ```solidity
-// Lock collateral for a derivative
-function _lockCollateral(bytes32 positionKey, uint256 poolId, uint256 amount) internal;
+// Lock collateral for a derivative (uses directLocked)
+function _lockCollateral(bytes32 positionKey, uint256 poolId, uint256 amount) internal {
+    LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, poolId);
+    enc.directLocked += amount;
+}
 
 // Unlock collateral (on exercise, settlement, or reclaim)
-function _unlockCollateral(bytes32 positionKey, uint256 poolId, uint256 amount) internal;
+function _unlockCollateral(bytes32 positionKey, uint256 poolId, uint256 amount) internal {
+    LibEncumbrance.Encumbrance storage enc = LibEncumbrance.position(positionKey, poolId);
+    enc.directLocked -= amount;
+}
 ```
 
 ### Price Normalization
@@ -453,6 +502,61 @@ function _normalizePrice(
 - `underlyingDecimals = 18`
 - `quoteDecimals = 6`
 - Result: `2000e6` (2000 USDC)
+
+---
+
+## Fee System
+
+### Fee Types
+
+| Fee Type | When Charged | Basis |
+|----------|--------------|-------|
+| **Create Fee** | Series creation | Collateral amount |
+| **Exercise Fee** | Exercise/settlement | Payment amount |
+| **Reclaim Fee** | Reclaiming expired collateral | Unlocked amount |
+
+### Fee Calculation
+
+Fees combine a basis points component and an optional flat fee:
+
+```solidity
+feeAmount = (baseAmount × feeBps / 10_000) + flatFeeWad
+```
+
+### Fee Routing
+
+All fees are routed through `LibFeeTreasury`, which delegates to `LibFeeRouter.routeSamePool`:
+
+```solidity
+// LibFeeTreasury routes fees to ACI/FI/Treasury
+(toTreasury, toActiveCredit, toFeeIndex) = LibFeeRouter.routeSamePool(
+    poolId, 
+    feeAmount, 
+    source,      // e.g., "OPTIONS_CREATE_FEE"
+    pullFromTracked,
+    extraBacking
+);
+```
+
+| Recipient | Configuration | Purpose |
+|-----------|---------------|---------|
+| **Treasury** | `treasurySplitBps` | Protocol revenue |
+| **Active Credit Index** | `activeCreditSplitBps` | Rewards for active borrowers |
+| **Fee Index** | Remainder | Rewards for pool depositors |
+
+### Custom Fees
+
+Series creators can specify custom fee rates within configured bounds:
+
+```solidity
+struct CreateOptionSeriesParams {
+    // ...
+    bool useCustomFees;        // Enable custom fees
+    uint16 createFeeBps;       // Must be within [minFeeBps, maxFeeBps]
+    uint16 exerciseFeeBps;
+    uint16 reclaimFeeBps;
+}
+```
 
 ---
 
@@ -830,3 +934,24 @@ event Reclaimed(
 6. **Grace Periods**: Futures have mandatory grace periods to prevent premature reclaim.
 
 7. **Pause Functionality**: Owner/timelock can pause options or futures independently.
+
+8. **Centralized Encumbrance Tracking**: Collateral is tracked through `LibEncumbrance`, which maintains separate tracking for:
+   - `directLocked`: Collateral locked for derivatives
+   - `directLent`: Principal lent out (AMM reserves)
+   - `directOfferEscrow`: Principal escrowed for open offers
+   - `indexEncumbered`: Principal encumbered for index tokens
+   
+   This centralized design ensures accurate available principal calculations across all protocol features.
+
+9. **Active Credit Index Integration**: Both Fee Index and Active Credit Index are settled before operations to ensure accurate yield accounting.
+
+10. **Centralized Fee Routing**: All fees are routed through `LibFeeRouter` ensuring consistent distribution to Treasury, ACI, and Fee Index.
+
+11. **Fee Bounds Validation**: Custom fees must be within configured `[minFeeBps, maxFeeBps]` bounds.
+
+---
+
+**Document Version:** 1.1
+**Last Updated:** January 2026
+
+*Changes in 1.1: Updated to reflect centralized encumbrance system (LibEncumbrance), centralized fee routing (LibFeeRouter with ACI/FI/Treasury split), expanded fee configuration with custom fees support, and Active Credit Index integration.*

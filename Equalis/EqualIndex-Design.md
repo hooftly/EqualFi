@@ -38,9 +38,9 @@ EqualIndex is a tokenized asset basket system that enables users to create, mana
 | **Per-Asset Fees** | Configurable mint/burn fees for each basket component |
 | **Fee Pot Distribution** | Accumulated fees distributed proportionally to holders on redemption |
 | **Flash Loan Support** | Borrow proportional basket amounts with fees |
-| **Protocol Revenue Sharing** | Configurable split between fee pots and protocol treasury |
-| **Position Integration** | Mint/burn using Position NFT collateral (encumbrance system) |
-| **Pool Fee Routing** | Portion of fees routed to underlying asset pools |
+| **Centralized Fee Routing** | Fees split between Fee Index, Fee Pot, and Protocol (ACI/FI/Treasury) |
+| **Position Integration** | Mint/burn using Position NFT collateral (centralized encumbrance system) |
+| **Pool Fee Routing** | Configurable portion of fees routed to underlying asset pool depositors |
 | **No External Oracles** | Deterministic pricing based on bundle composition |
 
 
@@ -139,14 +139,18 @@ src/views/
 
 src/libraries/
 ├── LibEqualIndex.sol             # Storage, events, constants
-└── LibIndexEncumbrance.sol       # Position encumbrance tracking
+├── LibEncumbrance.sol            # Centralized encumbrance tracking (all types)
+├── LibIndexEncumbrance.sol       # Index-specific encumbrance wrapper
+├── LibEqualIndexFees.sol         # Index action fee configuration
+├── LibFeeIndex.sol               # Pool fee index accounting
+└── LibFeeRouter.sol              # Centralized fee routing (ACI/FI/Treasury)
 ```
 
 ### Facet Responsibilities
 
 | Facet | Responsibility | Key Functions |
 |-------|---------------|---------------|
-| **EqualIndexAdminFacetV3** | Index creation and configuration | `createIndex`, `setIndexFees`, `setPaused`, `setPoolFeeShareBps` |
+| **EqualIndexAdminFacetV3** | Index creation and configuration | `createIndex`, `setIndexFees`, `setPaused`, `setPoolFeeShareBps`, `setMintBurnFeeIndexShareBps` |
 | **EqualIndexActionsFacetV3** | Core operations with direct transfers | `mint`, `burn`, `flashLoan` |
 | **EqualIndexPositionFacet** | Position-based operations | `mintFromPosition`, `burnFromPosition` |
 | **EqualIndexViewFacetV3** | Read-only queries | `getIndex`, `getIndexAssets`, `getVaultBalance`, `getFeePot` |
@@ -162,7 +166,8 @@ struct EqualIndexStorage {
     mapping(uint256 => mapping(address => uint256)) feePots;         // Accumulated fees per asset
     mapping(address => uint256) protocolBalances;                    // Legacy (fees now transfer directly)
     mapping(uint256 => uint256) indexToPoolId;                       // Index token pool mapping
-    uint16 poolFeeShareBps;                                          // Share routed to pool fee index
+    uint16 poolFeeShareBps;                                          // Share routed to pool fee index (flash loans)
+    uint16 mintBurnFeeIndexShareBps;                                 // Share routed to pool fee index (mint/burn)
 }
 ```
 
@@ -376,13 +381,13 @@ interface IEqualIndexFlashReceiver {
 
 ### Flash Fee Distribution
 
-Flash loan fees are split three ways:
+Flash loan fees are distributed through the centralized fee mechanism:
 
 | Recipient | Share | Purpose |
 |-----------|-------|---------|
-| **Pool Fee Index** | `poolFeeShareBps` (default 10%) | Distributed to underlying pool depositors |
+| **Fee Index (Pool Depositors)** | `poolFeeShareBps` (default 10%) | Rewards underlying pool depositors |
 | **Fee Pot** | Remainder after protocol | Distributed to index holders |
-| **Protocol Treasury** | `protocolCutBps` of remainder | Protocol revenue |
+| **Protocol (ACI/FI/Treasury)** | `protocolCutBps` of remainder | Protocol revenue via LibFeeRouter |
 
 ---
 
@@ -394,17 +399,29 @@ Position NFT holders can mint and burn index tokens using their encumbered colla
 
 ### Encumbrance System
 
-The `LibIndexEncumbrance` library tracks how much of a position's principal is committed to indexes:
+The encumbrance system uses a centralized architecture via `LibEncumbrance`, which tracks all encumbrance types per position and pool. `LibIndexEncumbrance` provides a thin wrapper for index-specific operations:
 
 ```solidity
+// LibEncumbrance - Centralized storage for all encumbrance types
+struct Encumbrance {
+    uint256 directLocked;       // Direct lending locked collateral
+    uint256 directLent;         // Direct lending lent amounts
+    uint256 directOfferEscrow;  // Direct offer escrow amounts
+    uint256 indexEncumbered;    // Index-encumbered principal
+}
+
 struct EncumbranceStorage {
-    // positionKey => poolId => total encumbered amount
-    mapping(bytes32 => mapping(uint256 => uint256)) encumbered;
+    // positionKey => poolId => all encumbrance components
+    mapping(bytes32 => mapping(uint256 => Encumbrance)) encumbrance;
     
     // positionKey => poolId => indexId => encumbered for specific index
     mapping(bytes32 => mapping(uint256 => mapping(uint256 => uint256))) encumberedByIndex;
 }
+
+// Total encumbered = directLocked + directLent + directOfferEscrow + indexEncumbered
 ```
+
+This centralized design ensures consistent available principal calculations across all protocol features.
 
 ### Minting from Position
 
@@ -476,57 +493,82 @@ event EncumbranceDecreased(
 | **Asset Source** | External wallet | Position collateral |
 | **Token Recipient** | Any address | Position (in index pool) |
 | **Capital Efficiency** | Requires full transfer | Uses existing deposits |
-| **Fee Routing** | Fee pot + protocol | Pool fee index + fee pot |
+| **Fee Index Share** | `mintBurnFeeIndexShareBps` (40%) | `poolFeeShareBps` (10%) |
+| **Fee Routing** | FI + Fee pot + Protocol | FI + Fee pot |
 | **Composability** | Standard ERC20 | Integrated with Equalis |
 
 ---
 
 ## Fee System
 
-### Fee Split Mechanism
+### Fee Distribution Architecture
 
-All fees are split between the fee pot (for holders) and protocol treasury:
+All index fees are distributed through a centralized 3-way split mechanism:
 
 ```solidity
-function _splitFee(uint256 fee, uint16 protocolCutBps, bool protocolEnabled)
-    internal pure returns (uint256 potShare, uint256 protocolShare)
-{
-    if (fee == 0) return (0, 0);
-    if (!protocolEnabled) {
-        return (fee, 0);  // Full fee to pot when treasury unset
-    }
-    potShare = fee × (10_000 - protocolCutBps) / 10_000;
-    protocolShare = fee - potShare;
+function _distributeIndexFee(
+    uint256 indexId,
+    Index storage idx,
+    address asset,
+    uint256 fee,
+    uint16 feeIndexShareBps
+) internal {
+    // 1. Fee Index share (to underlying asset pool depositors)
+    uint256 poolShare = fee × feeIndexShareBps / 10_000;
+    LibFeeIndex.accrueWithSourceUsingBacking(poolId, poolShare, INDEX_FEE_SOURCE, poolShare);
+    
+    // 2. Split remainder between Fee Pot and Protocol routing
+    uint256 remainder = fee - poolShare;
+    uint256 potFee = remainder × (10_000 - protocolCutBps) / 10_000;
+    uint256 protocolFee = remainder - potFee;
+    
+    // Fee Pot: distributed to index holders on redemption
+    feePots[indexId][asset] += potFee;
+    
+    // Protocol: routed through LibFeeRouter (ACI/FI/Treasury split)
+    LibFeeRouter.routeSamePool(poolId, protocolFee, INDEX_FEE_SOURCE, true, protocolFee);
 }
 ```
 
+### Fee Index Share Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `poolFeeShareBps` | 1000 (10%) | Fee Index share for flash loan fees |
+| `mintBurnFeeIndexShareBps` | 4000 (40%) | Fee Index share for mint/burn fees |
+
+### Protocol Fee Routing
+
+Protocol fees are routed through `LibFeeRouter.routeSamePool`, which splits fees between:
+
+| Recipient | Configuration | Purpose |
+|-----------|---------------|---------|
+| **Treasury** | `treasurySplitBps` | Protocol revenue |
+| **Active Credit Index (ACI)** | `activeCreditSplitBps` | Rewards for active borrowers |
+| **Fee Index (FI)** | Remainder | Rewards for pool depositors |
+
 ### Fee Sources
 
-| Operation | Fee Basis | Fee Rate | Distribution |
-|-----------|-----------|----------|--------------|
-| **Mint** | Required asset amount | Per-asset `mintFeeBps` | Fee pot + protocol |
-| **Burn** | Gross redemption amount | Per-asset `burnFeeBps` | Fee pot + protocol |
-| **Flash Loan** | Loan amount (NAV share) | `flashFeeBps` | Pool + fee pot + protocol |
-| **Position Mint** | Required asset amount | Per-asset `mintFeeBps` | Pool + fee pot |
-| **Position Burn** | Gross redemption amount | Per-asset `burnFeeBps` | Pool + fee pot |
+| Operation | Fee Basis | Fee Rate | Fee Index Share | Distribution |
+|-----------|-----------|----------|-----------------|--------------|
+| **Mint** | Required asset amount | Per-asset `mintFeeBps` | 40% (default) | FI + Fee pot + Protocol |
+| **Burn** | Gross redemption amount | Per-asset `burnFeeBps` | 40% (default) | FI + Fee pot + Protocol |
+| **Flash Loan** | Loan amount (NAV share) | `flashFeeBps` | 10% (default) | FI + Fee pot + Protocol |
+| **Position Mint** | Required asset amount | Per-asset `mintFeeBps` | `poolFeeShareBps` | FI + Fee pot |
+| **Position Burn** | Gross redemption amount | Per-asset `burnFeeBps` | `poolFeeShareBps` | FI + Fee pot |
 
-### Pool Fee Routing
+### Fee Pot Distribution
 
-For flash loans and position operations, a portion of fees routes to underlying asset pools:
-
-```solidity
-uint16 poolFeeShareBps = _poolFeeShareBps();  // Default: 1000 (10%)
-uint256 poolShare = fee × poolFeeShareBps / 10_000;
-LibFeeIndex.accrueWithSource(poolId, poolShare, INDEX_FEE_SOURCE);
-```
-
-This rewards pool depositors for providing the underlying liquidity.
+Holders receive their proportional share of accumulated fees on redemption:
+- Fee pots grow from mint fees, burn fees, and flash fees
+- Each burn distributes `feePot × units / totalSupply` to the redeemer
+- Remaining fee pot continues accumulating for other holders
 
 ### Treasury Behavior
 
 | Treasury State | Behavior |
 |----------------|----------|
-| **Configured** | Protocol share transferred immediately via `_creditProtocol` |
+| **Configured** | Protocol share routed through `LibFeeRouter` (ACI/FI/Treasury split) |
 | **Not configured** | Full fee goes to fee pot (no protocol accumulation) |
 
 ### Administrative Functions
@@ -544,8 +586,11 @@ function setIndexFees(
 // Pause/unpause index (timelock only)
 function setPaused(uint256 indexId, bool paused) external;
 
-// Set pool fee share (timelock only)
+// Set pool fee share for flash loans (timelock only)
 function setPoolFeeShareBps(uint16 shareBps) external;
+
+// Set pool fee share for mint/burn operations (timelock only)
+function setMintBurnFeeIndexShareBps(uint16 shareBps) external;
 ```
 
 ---
@@ -1464,13 +1509,19 @@ All state-changing functions use `nonReentrant` modifier. Flash loan callbacks e
 | Function | Access |
 |----------|--------|
 | `createIndex` | Governance (free) or public (with fee) |
-| `setIndexFees`, `setPaused`, `setPoolFeeShareBps` | Timelock only |
+| `setIndexFees`, `setPaused`, `setPoolFeeShareBps`, `setMintBurnFeeIndexShareBps` | Timelock only |
 | `mint`, `burn`, `flashLoan` | Anyone (when not paused) |
 | `mintFromPosition`, `burnFromPosition` | Position NFT owner only |
 
 ### 6. Encumbrance Isolation
 
-Position encumbrance is tracked per-pool and per-index, preventing double-counting and ensuring accurate available principal calculations.
+Position encumbrance is tracked through the centralized `LibEncumbrance` library, which maintains separate tracking for:
+- Direct lending locked collateral
+- Direct lending lent amounts  
+- Direct offer escrow amounts
+- Index-encumbered principal
+
+This centralized design ensures accurate available principal calculations across all protocol features and prevents double-counting.
 
 ### 7. Pool Requirement
 
@@ -1496,7 +1547,7 @@ Bundle composition (assets and amounts) is fixed at creation. Only fee parameter
 For any creation parameters, a valid index is created iff all parameters meet validation criteria and all assets have pools.
 
 ### Property 2: Fee Splitting Consistency
-For any fee amount: `potShare + protocolShare = totalFee`.
+For any fee amount: `feeIndexShare + potShare + protocolShare = totalFee`, where `feeIndexShare = fee × feeIndexShareBps / 10_000` and `protocolShare = (fee - feeIndexShare) × protocolCutBps / 10_000`.
 
 ### Property 3: Minting Proportionality
 For indexes with existing supply, minting preserves proportional ownership across all holders.
@@ -1508,7 +1559,7 @@ Total assets distributed equals proportional share of vault + fee pots minus bur
 Contract balance after repayment equals balance before plus fees for each asset.
 
 ### Property 6: Encumbrance Consistency
-For any position: `encumbered[positionKey][poolId] = Σ encumberedByIndex[positionKey][poolId][indexId]`.
+For any position: `LibEncumbrance.total(positionKey, poolId) = directLocked + directLent + directOfferEscrow + indexEncumbered`, and `indexEncumbered = Σ encumberedByIndex[positionKey][poolId][indexId]`.
 
 ### Property 7: Solvency Invariant
 For any index: `vaultBalance[asset] >= bundleAmount[asset] × totalSupply / INDEX_SCALE`.
@@ -1524,4 +1575,7 @@ Administrative functions succeed iff caller is timelock.
 
 ---
 
-**Document Version:** 3.0
+**Document Version:** 3.1
+**Last Updated:** January 2026
+
+*Changes in 3.1: Updated to reflect centralized encumbrance system (LibEncumbrance), centralized fee routing (LibFeeRouter with ACI/FI/Treasury split), and new mintBurnFeeIndexShareBps parameter.*

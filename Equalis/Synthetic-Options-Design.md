@@ -30,6 +30,8 @@ The EqualLend Direct lending rail enables option-like payoffs through a clever u
 | **Upfront Premium** | Interest paid at loan origination acts as option premium |
 | **Physical Settlement** | Assets are exchanged, not cash-settled |
 | **Flexible Exercise** | American or European style via `allowEarlyExercise` flag |
+| **Centralized Encumbrance** | Collateral tracked via unified `LibEncumbrance` system |
+| **Centralized Fee Routing** | Default fees distributed via `LibFeeRouter` (ACI/FI/Treasury) |
 
 ### The Core Mechanism
 
@@ -218,13 +220,16 @@ src/equallend-direct/
 ├── EqualLendDirectOfferFacet.sol      # Post and cancel offers
 ├── EqualLendDirectAgreementFacet.sol  # Accept offers, create agreements
 ├── EqualLendDirectLifecycleFacet.sol  # Repay, exercise, recover
-├── LibDirectExercise.sol              # Exercise/default logic
+├── LibDirectExercise.sol              # Shared exercise/default logic
 └── IDirectOfferEvents.sol             # Event definitions
 
 src/libraries/
 ├── DirectTypes.sol                    # Data structures
 ├── LibDirectStorage.sol               # Diamond storage
-└── LibDirectHelpers.sol               # Utility functions
+├── LibDirectHelpers.sol               # Utility functions
+├── LibEncumbrance.sol                 # Centralized encumbrance tracking
+├── LibFeeRouter.sol                   # Centralized fee routing (ACI/FI/Treasury)
+└── LibActiveCreditIndex.sol           # Active credit index accounting
 ```
 
 ### Data Structures
@@ -257,8 +262,8 @@ struct DirectAgreement {
     address lender;
     address borrower;
     uint256 lenderPositionId;
-    uint256 borrowerPositionId;
     uint256 lenderPoolId;
+    uint256 borrowerPositionId;
     uint256 collateralPoolId;
     address collateralAsset;
     address borrowAsset;
@@ -270,6 +275,7 @@ struct DirectAgreement {
     bool allowEarlyExercise;
     bool allowLenderCall;
     DirectStatus status;            // Active, Repaid, Defaulted, Exercised
+    bool interestRealizedUpfront;   // Whether interest was deducted at acceptance
 }
 ```
 
@@ -399,20 +405,40 @@ The lender call feature allows the option writer to force early expiration, usef
 
 ### Platform Configuration
 
+The platform configuration uses a centralized fee routing system:
+
 ```solidity
 struct DirectConfig {
-    uint16 platformFeeBps;                    // Platform fee on premium
-    uint16 platformSplitLenderBps;            // Lender's share of platform fee
-    uint16 platformSplitFeeIndexBps;          // Fee index share
-    uint16 platformSplitProtocolBps;          // Protocol treasury share
-    uint16 platformSplitActiveCreditIndexBps; // Active credit index share
-    uint16 defaultFeeIndexBps;                // Fee index share on default
-    uint16 defaultProtocolBps;                // Protocol share on default
-    uint16 defaultActiveCreditIndexBps;       // Active credit share on default
-    uint40 minInterestDuration;               // Minimum duration for interest calc
-    address protocolTreasury;                 // Treasury address
+    uint16 platformFeeBps;        // Platform fee on premium
+    uint16 interestLenderBps;     // Lender's share of interest
+    uint16 platformFeeLenderBps;  // Lender's share of platform fee
+    uint16 defaultLenderBps;      // Lender's share on default/exercise
+    uint40 minInterestDuration;   // Minimum duration for interest calc
 }
 ```
+
+### Default/Exercise Fee Distribution
+
+When a borrower exercises or defaults, collateral is distributed using the centralized `LibFeeRouter`:
+
+```solidity
+// Calculate shares using LibFeeRouter.previewSplit for protocol portion
+lenderShare = collateral × defaultLenderBps / 10_000;
+remainder = collateral - lenderShare;
+
+// LibFeeRouter splits remainder between:
+// - Treasury (treasurySplitBps)
+// - Active Credit Index (activeCreditSplitBps)  
+// - Fee Index (remainder)
+(protocolShare, activeCreditShare, feeIndexShare) = LibFeeRouter.previewSplit(remainder);
+```
+
+| Recipient | Source | Purpose |
+|-----------|--------|---------|
+| **Lender** | `defaultLenderBps` of collateral | Compensation for exercised option |
+| **Treasury** | `treasurySplitBps` of remainder | Protocol revenue |
+| **Active Credit Index** | `activeCreditSplitBps` of remainder | Rewards for active borrowers |
+| **Fee Index** | Remaining portion | Rewards for pool depositors |
 
 ---
 
@@ -713,10 +739,27 @@ event DirectAgreementCalled(uint256 indexed agreementId, uint256 indexed lenderP
 
 3. **Grace Period Protection**: 1-day grace period prevents accidental defaults due to timing issues.
 
-4. **Collateral Isolation**: Locked collateral cannot be withdrawn or used for other purposes during the agreement.
+4. **Centralized Encumbrance Tracking**: Collateral is tracked through `LibEncumbrance`, which maintains separate tracking for:
+   - `directLocked`: Collateral locked by borrowers
+   - `directLent`: Principal lent by lenders
+   - `directOfferEscrow`: Principal escrowed for open offers
+   - `indexEncumbered`: Principal encumbered for index tokens
+   
+   This centralized design ensures accurate available principal calculations across all protocol features.
 
 5. **Reentrancy Protection**: All lifecycle functions use `nonReentrant` modifier.
 
 6. **Position NFT Ownership**: Only the Position NFT owner can repay or exercise.
 
 7. **Solvency Checks**: Both lender and borrower positions are checked for solvency before agreement creation.
+
+8. **Active Credit Index Integration**: Both lender P2P exposure and borrower debt are tracked in the Active Credit Index for proper yield distribution.
+
+9. **Centralized Fee Routing**: Default/exercise fees are routed through `LibFeeRouter` ensuring consistent distribution to Treasury, ACI, and Fee Index.
+
+---
+
+**Document Version:** 1.1
+**Last Updated:** January 2026
+
+*Changes in 1.1: Updated to reflect centralized encumbrance system (LibEncumbrance), centralized fee routing (LibFeeRouter with ACI/FI/Treasury split), simplified DirectConfig structure, and Active Credit Index integration.*
